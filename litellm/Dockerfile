@@ -7,9 +7,9 @@
 # dependencies and backport the upstream filelock bound. No license gate is bypassed.
 # This does not make the complete image MIT-licensed: its OS, Python, Rust and
 # JavaScript dependencies retain their own license/source-distribution duties.
-# CI may publish privately for owner evaluation after validation. Public
-# redistribution remains on hold pending license/source review; a successful
-# CVE scan or functional test does not establish license clearance.
+# The owner selected public GHCR publication after technical validation.
+# A successful CVE scan or functional test does not establish license clearance;
+# preserve applicable notices and satisfy corresponding-source obligations.
 #
 # PUBLIC REPOSITORY RULES
 # - Track <open-source-name>/Dockerfile and reviewed build workflows only.
