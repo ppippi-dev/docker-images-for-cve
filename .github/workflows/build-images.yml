@@ -1,8 +1,8 @@
 # Add each OSS as <name>/Dockerfile with an org.opencontainers.image.version label.
 # Build contexts stay empty; no local configuration or internal reports are inputs.
-# Registry publication is disabled pending image redistribution-license review.
-# Do not restore package-write permissions or push steps based on a CVE scan alone.
-name: Build and verify OSS images
+# Publish validated images privately for the owner to pull.
+# Public redistribution remains blocked pending license/source review.
+name: Build, verify and publish private OSS images
 
 on:
   push:
@@ -93,9 +93,12 @@ jobs:
           print('Selected OSS images: ' + ', '.join(selected))
           PY
 
-  verify:
+  verify-pr:
     name: Verify ${{ matrix.oss }} (no publishing)
-    if: needs.discover.outputs.count != '0'
+    if: >-
+      needs.discover.outputs.count != '0' &&
+      (github.event_name == 'pull_request' ||
+       (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'))
     needs: discover
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -109,7 +112,8 @@ jobs:
       LOCAL_IMAGE: ci-local/${{ matrix.oss }}:${{ github.sha }}
     steps:
       - *checkout
-      - name: Build linux/amd64 with an empty context
+      - &build
+        name: Build linux/amd64 with an empty context
         shell: bash
         env:
           DOCKER_BUILDKIT: '1'
@@ -126,21 +130,25 @@ jobs:
           image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
           [[ "$image_version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]
           docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE" > "$RUNNER_TEMP/validated-image-id"
-      - name: Verify Enterprise components are absent from LiteLLM
+      - &exclusion
+        name: Verify Enterprise components are absent from LiteLLM
         if: matrix.oss == 'litellm'
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -i --network none --entrypoint /app/.venv/bin/python "$LOCAL_IMAGE" - <<'PYCODE'
+          docker run --rm -i --network none -e LITELLM_LOCAL_MODEL_COST_MAP=true --entrypoint /app/.venv/bin/python "$LOCAL_IMAGE" - <<'PYCODE'
           import importlib.metadata as metadata
           import importlib.util
           from pathlib import Path
           from packaging.requirements import Requirement
           assert metadata.version('litellm') == '1.106.6'
-          assert importlib.util.find_spec('litellm_enterprise') is None
+          for module in ('litellm_enterprise', 'ddtrace', '_ddtrace_internal'):
+              assert importlib.util.find_spec(module) is None
           names = {d.metadata['Name'].lower().replace('_', '-') for d in metadata.distributions()}
-          assert 'litellm-enterprise' not in names
-          assert all(Requirement(r).name.lower().replace('_', '-') != 'litellm-enterprise'
+          assert not names.intersection({'litellm-enterprise', 'ddtrace', 'ddtrace-internal'})
+          assert not Path('/app/.venv/bin/ddtrace-run').exists()
+          assert not Path('/app/.venv/bin/_dd_crashtracker_receiver').exists()
+          assert all(Requirement(r).name.lower().replace('_', '-') not in {'litellm-enterprise', 'ddtrace', 'ddtrace-internal'}
                      for r in metadata.requires('litellm') or [])
           assert not Path('/app/enterprise').exists()
           root = Path(metadata.distribution('litellm').locate_file('litellm'))
@@ -153,14 +161,23 @@ jobs:
           assert proxy_server.enterprise_proxy_config is None
           print('PASS absent Enterprise package/source/dependency; rebuilt OSS UI and Rust extension load')
           PYCODE
-      - name: Check all exported layers for removed Enterprise paths
+          for option in USE_DDTRACE USE_DDPROFILER; do
+            set +e
+            docker run --rm --network none -e "$option=true" "$LOCAL_IMAGE" --help > "$RUNNER_TEMP/datadog-guard.log" 2>&1
+            status=$?
+            set -e
+            test "$status" = 64
+          done
+          echo 'PASS explicit startup rejection for unsupported Datadog instrumentation'
+      - &layers
+        name: Check all exported layers for removed Enterprise paths
         if: matrix.oss == 'litellm'
         shell: bash
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/check-image-layers.py" <<'PYCODE'
           import json, re, sys, tarfile
-          restricted = re.compile(r'^(?:[.]/)?app/enterprise(/|$)|(^|/)site-packages/litellm_enterprise(/|$)|(^|/)site-packages/litellm_enterprise-[^/]+[.]dist-info(/|$)|(^|/)litellm/proxy/enterprise(/|$)')
+          restricted = re.compile(r'^(?:[.]/)?app/enterprise(/|$)|(^|/)site-packages/litellm_enterprise(/|$)|(^|/)site-packages/litellm_enterprise-[^/]+[.]dist-info(/|$)|(^|/)litellm/proxy/enterprise(/|$)|(^|/)site-packages/(ddtrace|_ddtrace_internal)(/|$)|(^|/)site-packages/(ddtrace|ddtrace_internal)-[^/]+[.]dist-info(/|$)|(^|/)bin/(ddtrace-run|_dd_crashtracker_receiver)$')
           inspected, declared = set(), set()
           entries = 0
           with tarfile.open(fileobj=sys.stdin.buffer, mode='r|') as image:
@@ -188,7 +205,8 @@ jobs:
           print(f'PASS {len(declared)} image layers / {entries} entries contain no restricted Enterprise paths')
           PYCODE
           docker save "$LOCAL_IMAGE" | python3 "$RUNNER_TEMP/check-image-layers.py"
-      - name: Install checksum-pinned Trivy 0.76.1
+      - &scanner
+        name: Install checksum-pinned Trivy 0.76.1
         shell: bash
         run: |
           set -euo pipefail
@@ -202,7 +220,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/trivy-bin"
           tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/trivy-bin" trivy
           "$RUNNER_TEMP/trivy-bin/trivy" --version
-      - name: Block on any vulnerability or scan error
+      - &scan
+        name: Block on any vulnerability or scan error
         shell: bash
         run: |
           set -euo pipefail
@@ -214,7 +233,8 @@ jobs:
             --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
             --skip-db-update=false --skip-java-db-update=false --timeout 30m \
             "$LOCAL_IMAGE"
-      - name: Verify LiteLLM API, authentication, streaming, UI and persistent database
+      - &runtime
+        name: Verify LiteLLM API, authentication, streaming, UI and persistent database
         if: matrix.oss == 'litellm'
         shell: bash
         run: |
@@ -332,14 +352,133 @@ jobs:
           docker exec -i ci-proxy /app/.venv/bin/python - < "$smoke_dir/check.py"
           docker restart ci-proxy
           docker exec -i ci-proxy /app/.venv/bin/python - existing-db < "$smoke_dir/check.py"
-      - name: Remove disposable smoke resources
+      - &cleanup
+        name: Remove disposable smoke resources
         if: always() && matrix.oss == 'litellm'
         shell: bash
         run: |
           docker rm -f ci-proxy ci-postgres >/dev/null 2>&1 || true
           docker network rm ci-smoke >/dev/null 2>&1 || true
-      - name: Confirm the validated image was not replaced
+      - &identity
+        name: Confirm the validated image was not replaced
         shell: bash
         run: |
           set -euo pipefail
           test "$(docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE")" = "$(cat "$RUNNER_TEMP/validated-image-id")"
+
+  publish-main:
+    name: Verify and privately publish ${{ matrix.oss }}
+    concurrency:
+      group: private-package-${{ github.repository }}-${{ matrix.oss }}
+      cancel-in-progress: false
+    if: >-
+      needs.discover.outputs.count != '0' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: discover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      OSS: ${{ matrix.oss }}
+      LOCAL_IMAGE: ci-local/${{ matrix.oss }}:${{ github.sha }}
+    steps:
+      - *checkout
+      - *build
+      - *exclusion
+      - *layers
+      - *scanner
+      - *scan
+      - *runtime
+      - *cleanup
+      - *identity
+      - name: Install Podman if the hosted runner does not provide it
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v podman >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends podman
+          fi
+          podman --version
+      - name: Publish private tags and verify Podman pull
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Serialize by OSS and refuse an older run after main has advanced.
+          python3 - <<'PYCODE'
+          import json, os, urllib.request
+          url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/ref/heads/main'
+          req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GHCR_TOKEN'],
+              'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+          with urllib.request.urlopen(req, timeout=30) as response:
+              current = json.load(response)['object']['sha']
+          if current != os.environ['GITHUB_SHA']:
+              raise SystemExit('Main advanced; refusing to publish an older revision over its tags')
+          PYCODE
+          registry_image="ghcr.io/${REGISTRY_OWNER,,}/$OSS"
+          image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
+          [[ "$image_version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,126}$ ]]
+          fixed_tag="v$image_version"
+          alias_tag="$fixed_tag"
+          if [ "$OSS" = litellm ]; then
+            base_name="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.name"}}' "$LOCAL_IMAGE")"
+            [[ "$base_name" == ghcr.io/berriai/litellm:v* ]]
+            alias_tag="${base_name##*:}"
+            [[ "$alias_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            [[ "$fixed_tag" == "$alias_tag-oss-"* ]]
+          fi
+          cat > "$RUNNER_TEMP/check-package-visibility.py" <<'PYCODE'
+          import json, os, sys, urllib.error, urllib.request
+          owner, name = os.environ['REGISTRY_OWNER'], os.environ['OSS']
+          url = f'https://api.github.com/users/{owner}/packages/container/{name}'
+          request = urllib.request.Request(url, headers={
+              'Authorization': 'Bearer ' + os.environ['GHCR_TOKEN'],
+              'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  package = json.load(response)
+          except urllib.error.HTTPError as error:
+              if error.code == 404 and sys.argv[1] == 'before':
+                  print('New GHCR packages default to private; verify again after publishing.')
+                  raise SystemExit(0)
+              raise
+          assert package['name'] == name and package['package_type'] == 'container'
+          assert package['owner']['login'].lower() == owner.lower()
+          assert package['visibility'] == 'private', 'Public publication is blocked pending redistribution review'
+          print('Verified private package visibility.')
+          PYCODE
+          python3 "$RUNNER_TEMP/check-package-visibility.py" before
+          image_id="$(cat "$RUNNER_TEMP/validated-image-id")"
+          test "$(docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE")" = "$image_id"
+          export DOCKER_CONFIG="$RUNNER_TEMP/ghcr-auth"
+          podman_auth="$RUNNER_TEMP/podman-auth.json"
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"; rm -f "$podman_auth"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
+          for tag in "$fixed_tag" "sha-$GITHUB_SHA" "$alias_tag"; do
+            docker tag "$image_id" "$registry_image:$tag"
+            docker push "$registry_image:$tag"
+          done
+          python3 "$RUNNER_TEMP/check-package-visibility.py" after
+          expected_digest="$(docker image inspect "$registry_image:$alias_tag" | python3 -c 'import json,sys; repo=sys.argv[1]; matches=[s.split("@",1)[1] for s in json.load(sys.stdin)[0]["RepoDigests"] if s.startswith(repo+"@")]; assert len(set(matches))==1; print(matches[0])' "$registry_image")"
+          # Podman has independent storage, so this checks a real registry pull.
+          printf '%s' "$GHCR_TOKEN" | podman login --authfile "$podman_auth" --username "$GHCR_USER" --password-stdin ghcr.io
+          podman pull --authfile "$podman_auth" --arch amd64 "$registry_image:$alias_tag"
+          pulled_id="$(podman image inspect --format '{{.Id}}' "$registry_image:$alias_tag")"
+          test "${pulled_id#sha256:}" = "${image_id#sha256:}"
+          test "$(podman image inspect --format '{{.Os}}/{{.Architecture}}' "$registry_image:$alias_tag")" = linux/amd64
+          digest="$(podman image inspect --format '{{.Digest}}' "$registry_image:$alias_tag")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$digest" = "$expected_digest"
+          printf 'Private package, verified by Podman: `%s:%s`\n\nCustom version: `%s:%s`\n\nDigest: `%s@%s`\n' \
+            "$registry_image" "$alias_tag" "$registry_image" "$fixed_tag" "$registry_image" "$digest" >> "$GITHUB_STEP_SUMMARY"

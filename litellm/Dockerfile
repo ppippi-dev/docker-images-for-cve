@@ -3,12 +3,13 @@
 # REDISTRIBUTION HOLD
 # Experimental OSS-only rebuild of LiteLLM 1.106.6: Enterprise source/package
 # is removed and the Python/Rust wheel + UI are rebuilt from the pinned source.
-# Core source changes are limited to the Enterprise dependency removal and the
-# documented upstream filelock bound. Enterprise license gates are not bypassed.
+# Source manifest changes remove Enterprise and optional Datadog tracing
+# dependencies and backport the upstream filelock bound. No license gate is bypassed.
 # This does not make the complete image MIT-licensed: its OS, Python, Rust and
 # JavaScript dependencies retain their own license/source-distribution duties.
-# CI builds and validates only. Do not publish until redistribution review is
-# complete; a successful CVE scan or functional test is not license clearance.
+# CI may publish privately for owner evaluation after validation. Public
+# redistribution remains on hold pending license/source review; a successful
+# CVE scan or functional test does not establish license clearance.
 #
 # PUBLIC REPOSITORY RULES
 # - Track <open-source-name>/Dockerfile and reviewed build workflows only.
@@ -42,8 +43,8 @@
 # OS fixes: libexpat1 2.9.0-r0 -> 2.10.0-r0;
 #   py3-pip-wheel 26.2.2-r0 -> 26.2.2-r2;
 #   python-3.13{,-base} 3.13.17_git20261023-r1 -> 3.13.18_git20261030-r0.
-# Main venv fixes: ddtrace 4.11.0 -> 4.15.6 (+ ddtrace-internal 0.1.0);
-#   dnspython 2.8.0 -> 2.9.0; filelock 3.32.7 -> 4.2.4;
+# Optional Datadog tracing is removed from this basic Gateway build.
+# Main venv fixes: dnspython 2.8.0 -> 2.9.0; filelock 3.32.7 -> 4.2.4;
 #   pyasn1 0.6.4 -> 0.6.5; pypdf 6.21.2 -> 6.21.4; tornado 6.5.10 -> 6.6.
 # Admin venv fixes: PyJWT 2.14.0 -> 2.15.0;
 #   opentelemetry-api 1.44.0 -> 1.45.1.
@@ -221,6 +222,7 @@ p = Path('pyproject.toml')
 s = p.read_text()
 for before, after in [
     ('    "litellm-enterprise==0.1.76.post1",\n', ''),
+    ('    "ddtrace>=4.8.2,<5.0",\n', ''),
     ('    "filelock>=3.16.1,<4.0",', '    "filelock>=3.16.1,<5",'),
 ]:
     if s.count(before) != 1:
@@ -329,8 +331,6 @@ apk add --no-cache --repositories-file /dev/null \
     xmlsec-openssl=1.3.13-r0
 
 cat > /tmp/patch-main.txt <<'REQ'
-ddtrace==4.15.6 --hash=sha256:2185df0b730e4bb78dfe40cf61b7e242d4b81724cea4f496ca5a0ae0f5427309
-ddtrace-internal==0.1.0 --hash=sha256:8eeac4a812e003cebafc8be35ef05103ae2b132893dfbcee00a67f4af81404a2
 dnspython==2.9.0 --hash=sha256:9a4aedb833c3c1b49214d04d44d3032ab7a9135f7c1d29a549b4ff78fd82fda9
 filelock==4.2.4 --hash=sha256:301241438c57936ef93f4243a94f2559022268bfcf9b375a9a72eb0f8db8358e
 pyasn1==0.6.5 --hash=sha256:4017b0fce125096b8573b39c989fdb1a4b19cf761e683398184550fea0e66587
@@ -578,21 +578,22 @@ RUN --mount=from=uv,source=/uv,target=/run/uv \
     --mount=from=oss-wheel-builder,source=/wheels,target=/run/oss-wheels \
     --mount=from=oss-wheel-builder,source=/source-notices,target=/run/source-notices <<'OSS_RUNTIME'
 set -eu
-/run/uv --no-config pip uninstall --python /app/.venv/bin/python litellm-enterprise
+/run/uv --no-config pip uninstall --python /app/.venv/bin/python litellm-enterprise ddtrace ddtrace-internal
 rm -rf /app/enterprise /app/litellm/proxy/_experimental/out
 /run/uv --no-config --no-cache pip install --python /app/.venv/bin/python \
     --no-deps --no-index --reinstall /run/oss-wheels/litellm-*.whl
 mkdir -p /usr/share/licenses/litellm-oss
 cp /run/source-notices/LICENSE /usr/share/licenses/litellm-oss/LICENSE
 cp /run/source-notices/pyproject.toml /usr/share/licenses/litellm-oss/pyproject.toml
-/app/.venv/bin/python - <<'PYCODE'
+LITELLM_LOCAL_MODEL_COST_MAP=true /app/.venv/bin/python - <<'PYCODE'
 import importlib.metadata as m
 import importlib.util
 from pathlib import Path
 from packaging.requirements import Requirement
 assert m.version('litellm') == '1.106.6'
-assert importlib.util.find_spec('litellm_enterprise') is None
-assert all(Requirement(r).name.lower().replace('_', '-') != 'litellm-enterprise'
+for module in ('litellm_enterprise', 'ddtrace', '_ddtrace_internal'):
+    assert importlib.util.find_spec(module) is None
+assert all(Requirement(r).name.lower().replace('_', '-') not in {'litellm-enterprise', 'ddtrace', 'ddtrace-internal'}
            for r in m.requires('litellm') or [])
 assert not Path('/app/enterprise').exists()
 root = Path(m.distribution('litellm').locate_file('litellm'))
@@ -603,6 +604,23 @@ print('Source-built OSS wheel and Rust extension verified')
 PYCODE
 /run/uv --no-config pip check --python /app/.venv/bin/python
 /run/uv --no-config pip check --python /opt/liteadmin/bin/python
+# Datadog instrumentation is intentionally not part of this OSS Gateway build.
+cat > /usr/local/bin/litellm-oss-entrypoint <<'ENTRYPOINT_SCRIPT'
+#!/bin/sh
+set -eu
+case "${USE_DDTRACE:-false}" in
+  [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])
+    echo 'USE_DDTRACE is unsupported: this image excludes optional Datadog tracing.' >&2
+    exit 64 ;;
+esac
+case "${USE_DDPROFILER:-false}" in
+  [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]|[Oo][Nn])
+    echo 'USE_DDPROFILER is unsupported: this image excludes optional Datadog profiling.' >&2
+    exit 64 ;;
+esac
+exec /app/docker/prod_entrypoint.sh "$@"
+ENTRYPOINT_SCRIPT
+chmod 0755 /usr/local/bin/litellm-oss-entrypoint
 OSS_RUNTIME
 
 # Export only the patched filesystem. Replaced libraries and removed archives
@@ -625,5 +643,5 @@ LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-imag
 WORKDIR /app
 USER root
 EXPOSE 4000/tcp
-ENTRYPOINT ["docker/prod_entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/litellm-oss-entrypoint"]
 CMD ["--port", "4000"]
