@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
+# REDISTRIBUTION HOLD
+# This recipe inherits Enterprise-licensed code from the official image.
+# Publishing this Dockerfile does not grant redistribution rights to that code.
+# Do not publish the built image until redistribution rights are established
+# or a separately reviewed build excludes the restricted components.
+# https://github.com/BerriAI/litellm/blob/v1.106.6/enterprise/LICENSE.md
+#
 # PUBLIC REPOSITORY RULES
 # - Track <open-source-name>/Dockerfile and reviewed build workflows only.
 #   Never commit organization data, configuration,

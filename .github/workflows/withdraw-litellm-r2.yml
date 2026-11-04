@@ -1,0 +1,79 @@
+# Temporary withdrawal of the exact image published by this repository.
+# No checkout, builds, credentials from users, or unrelated package mutations.
+name: Withdraw unreviewed LiteLLM r2 image
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/withdraw-litellm-r2.yml']
+
+permissions: {}
+
+concurrency:
+  group: withdraw-litellm-r2
+  cancel-in-progress: false
+
+jobs:
+  withdraw:
+    if: github.repository == 'ppippi-dev/docker-images-for-cve' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      packages: write
+    steps:
+      - name: Delete only the previously published r2 digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, urllib.error, urllib.request
+          endpoint = 'https://api.github.com/users/ppippi-dev/packages/container/litellm/versions'
+          digest = 'sha256:1db510b65c31d92601667b56a56f85b6458671a35adfa01c000ecf49eb55a709'
+          tags = {'1.106.6-r2', 'sha-88d2441f5c2d0c7fbe672b65d8688a5e5533d5da'}
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                     'Accept': 'application/vnd.github+json',
+                     'X-GitHub-Api-Version': '2022-11-28'}
+          def request(url, method='GET'):
+              req = urllib.request.Request(url, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  body = response.read()
+                  return response.status, json.loads(body) if body else None
+          versions = []
+          for page in range(1, 101):
+              _, batch = request(endpoint + '?per_page=100&page=' + str(page))
+              if not isinstance(batch, list):
+                  raise SystemExit('Unexpected package response; refusing changes')
+              versions.extend(batch)
+              if len(batch) < 100:
+                  break
+          else:
+              raise SystemExit('Package pagination limit reached; refusing changes')
+          matches = [version for version in versions if version['name'] == digest]
+          if len(matches) != 1:
+              raise SystemExit('Expected exactly one matching image digest; refusing changes')
+          target = matches[0]
+          if set(target['metadata']['container']['tags']) != tags:
+              raise SystemExit('Expected exactly the two known r2 tags; refusing changes')
+          version_id = target['id']
+          if type(version_id) is not int or version_id <= 0:
+              raise SystemExit('Invalid version identifier; refusing changes')
+          url = endpoint + '/' + str(version_id)
+          _, confirmed = request(url)
+          if confirmed['name'] != digest or set(confirmed['metadata']['container']['tags']) != tags:
+              raise SystemExit('Version changed during review; refusing changes')
+          status, _ = request(url, 'DELETE')
+          if status != 204:
+              raise SystemExit('Deletion did not return HTTP 204')
+          try:
+              request(url)
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          else:
+              raise SystemExit('Deleted version remains accessible through the API')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Withdrew only LiteLLM package version {version_id}, `{digest}`.\n')
+          print(f'Withdrew and verified package version {version_id}: {digest}')
+          PY

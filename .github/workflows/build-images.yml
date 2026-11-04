@@ -1,6 +1,8 @@
 # Add each OSS as <name>/Dockerfile with an org.opencontainers.image.version label.
 # Build contexts stay empty; no local configuration or internal reports are inputs.
-name: Build, scan and publish OSS images
+# Registry publication is disabled pending image redistribution-license review.
+# Do not restore package-write permissions or push steps based on a CVE scan alone.
+name: Build and verify OSS images
 
 on:
   push:
@@ -91,12 +93,9 @@ jobs:
           print('Selected OSS images: ' + ', '.join(selected))
           PY
 
-  verify-pr:
+  verify:
     name: Verify ${{ matrix.oss }} (no publishing)
-    if: >-
-      needs.discover.outputs.count != '0' &&
-      (github.event_name == 'pull_request' ||
-       (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'))
+    if: needs.discover.outputs.count != '0'
     needs: discover
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -110,8 +109,7 @@ jobs:
       LOCAL_IMAGE: ci-local/${{ matrix.oss }}:${{ github.sha }}
     steps:
       - *checkout
-      - &build
-        name: Build linux/amd64 with an empty context
+      - name: Build linux/amd64 with an empty context
         shell: bash
         env:
           DOCKER_BUILDKIT: '1'
@@ -128,8 +126,7 @@ jobs:
           image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
           [[ "$image_version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]
           docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE" > "$RUNNER_TEMP/validated-image-id"
-      - &scanner
-        name: Install checksum-pinned Trivy 0.76.1
+      - name: Install checksum-pinned Trivy 0.76.1
         shell: bash
         run: |
           set -euo pipefail
@@ -143,8 +140,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/trivy-bin"
           tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/trivy-bin" trivy
           "$RUNNER_TEMP/trivy-bin/trivy" --version
-      - &scan
-        name: Block on any vulnerability or scan error
+      - name: Block on any vulnerability or scan error
         shell: bash
         run: |
           set -euo pipefail
@@ -156,8 +152,7 @@ jobs:
             --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
             --skip-db-update=false --skip-java-db-update=false --timeout 30m \
             "$LOCAL_IMAGE"
-      - &runtime
-        name: Verify LiteLLM API, authentication, streaming, UI and persistent database
+      - name: Verify LiteLLM API, authentication, streaming, UI and persistent database
         if: matrix.oss == 'litellm'
         shell: bash
         run: |
@@ -275,65 +270,14 @@ jobs:
           docker exec -i ci-proxy /app/.venv/bin/python - < "$smoke_dir/check.py"
           docker restart ci-proxy
           docker exec -i ci-proxy /app/.venv/bin/python - existing-db < "$smoke_dir/check.py"
-      - &cleanup
-        name: Remove disposable smoke resources
+      - name: Remove disposable smoke resources
         if: always() && matrix.oss == 'litellm'
         shell: bash
         run: |
           docker rm -f ci-proxy ci-postgres >/dev/null 2>&1 || true
           docker network rm ci-smoke >/dev/null 2>&1 || true
-      - &identity
-        name: Confirm the validated image was not replaced
+      - name: Confirm the validated image was not replaced
         shell: bash
         run: |
           set -euo pipefail
           test "$(docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE")" = "$(cat "$RUNNER_TEMP/validated-image-id")"
-
-  publish-main:
-    name: Verify and publish ${{ matrix.oss }} (main)
-    if: >-
-      needs.discover.outputs.count != '0' && github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: discover
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
-    env:
-      OSS: ${{ matrix.oss }}
-      LOCAL_IMAGE: ci-local/${{ matrix.oss }}:${{ github.sha }}
-    steps:
-      - *checkout
-      - *build
-      - *scanner
-      - *scan
-      - *runtime
-      - *cleanup
-      - *identity
-      - name: Publish the exact validated image to GHCR
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GHCR_USER: ${{ github.actor }}
-          REGISTRY_OWNER: ${{ github.repository_owner }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          registry_image="ghcr.io/${REGISTRY_OWNER,,}/$OSS"
-          image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
-          [[ "$image_version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]
-          # The auth directory is ephemeral and never added to the build context.
-          export DOCKER_CONFIG="$RUNNER_TEMP/ghcr-auth"
-          mkdir -p "$DOCKER_CONFIG"
-          chmod 700 "$DOCKER_CONFIG"
-          trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"' EXIT
-          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
-          docker tag "$LOCAL_IMAGE" "$registry_image:$image_version"
-          docker tag "$LOCAL_IMAGE" "$registry_image:sha-$GITHUB_SHA"
-          docker push "$registry_image:$image_version"
-          docker push "$registry_image:sha-$GITHUB_SHA"
-          printf 'Published `%s:%s` and `%s:sha-%s` from the validated image.\n' \
-            "$registry_image" "$image_version" "$registry_image" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
