@@ -21,20 +21,21 @@
 #   secret-valued ARG/ENV. Build from stdin with an empty context (command below).
 # - Keep tests, reports and exported images outside this repository. Never use
 #   CVE ignores, severity filtering or --ignore-unfixed to claim a clean image.
-# - Re-scan every candidate with a fresh vulnerability DB. Scanner errors and
-#   non-runtime vulnerabilities block publication. The owner permits identified
-#   language runtime/compiler findings; keep all findings visible. This is not
-#   a zero-CVE claim or an override of the destination import policy.
+# - Re-scan every candidate with a fresh vulnerability DB and retain all findings.
+#   No runtime/compiler exceptions: every component must satisfy CVSS v3 = 0.
+#   Any v3 score > 0, unknown/malformed assessment, or scanner error blocks.
+#   A score omitted by Trivy is accepted only if its complete valid v3 vector
+#   proves zero base impact; missing assessments are never treated as zero.
 # - Preserve upstream license notices; an image contains multiple licenses.
 #
 # Build (linux/amd64 only; no local build context is sent):
-#   docker build --platform linux/amd64 -t litellm-cve:1.106.6-oss-r4 - < litellm/Dockerfile
+#   docker build --platform linux/amd64 -t litellm-cve:1.106.6-oss-r5 - < litellm/Dockerfile
 # Optional HTTPS proxy CA: add --secret id=build_ca,src=/path/to/combined-ca.pem
 # The CA is a temporary BuildKit mount, never copied into an image layer.
 # Supplementary public scan (run outside this repository; Trivy 0.76.1):
 #   trivy image --scanners vuln --ignorefile '' --ignore-unfixed=false \
 #     --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
-#     litellm-cve:1.106.6-oss-r4
+#     litellm-cve:1.106.6-oss-r5
 # The destination's approved scanner must also accept the exact image. Trivy
 # alone does not establish acceptance by a different scanner or policy.
 # Run API/authentication, streaming, UI and fresh/existing DB checks as well.
@@ -44,13 +45,16 @@
 # vulnerability DB updated 2026-11-03T19:16:30Z: 10 OS + 33 Python findings.
 # OS fixes: libexpat1 2.9.0-r0 -> 2.10.0-r0;
 #   py3-pip-wheel 26.2.2-r0 -> 26.2.2-r2;
-# Runtime Python stays at upstream 3.13.17_git20261023-r1 at the owner's request.
-# The owner permits Python/runtime CVEs for publication while keeping their
-# scan findings visible. Dependencies such as HTTPX remain subject to the gate.
+# Owner-authorized Python 3.13 security update:
+#   upstream 3.13.17_git20261023-r1 -> 3.13.18_git20261030-r0.
+# Public package/security sources: https://packages.wolfi.dev/os/
+#   https://packages.wolfi.dev/os/security.json
+#   https://github.com/wolfi-dev/os/blob/main/python-3.13.yaml
+# Record original and patched runtime versions/binary hashes for CI verification.
 # HTTPX 0.28.1+cvebackport.1 adds bounded decoding and multipart header validation.
 # References: https://github.com/pydantic/httpx2/security/advisories/GHSA-8xx6-hgc6-gc2m
 #             https://github.com/pydantic/httpx2/security/advisories/GHSA-h4x7-gw46-3wm6
-# CVE-2026-3479 is disputed; upstream Python 3.13.17 is outside the PSF affected range.
+# CVE-2026-3479 is disputed; Python 3.13.18 is outside the PSF affected range.
 # https://github.com/psf/advisory-database/blob/main/advisories/python/PSF-2026-13.json
 # Optional Datadog tracing is removed from this basic Gateway build.
 # Main venv fixes: dnspython 2.8.0 -> 2.9.0; filelock 3.32.7 -> 4.2.4;
@@ -693,7 +697,7 @@ FROM upstream AS patched
 
 ARG TARGETARCH
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="1.106.6-oss-r4" \
+      org.opencontainers.image.version="1.106.6-oss-r5" \
       org.opencontainers.image.description="Custom dependency remediation of LiteLLM 1.106.6 for linux/amd64; requires a fresh vulnerability scan before use"
 
 # uv exists only during this RUN; it is not installed in the resulting image.
@@ -724,8 +728,8 @@ apk add --no-cache --repositories-file /dev/null \
     --repository https://packages.wolfi.dev/os \
     libexpat1=2.10.0-r0 \
     py3-pip-wheel=26.2.2-r2 \
-    python-3.13=3.13.17_git20261023-r1 \
-    python-3.13-base=3.13.17_git20261023-r1 \
+    python-3.13=3.13.18_git20261030-r0 \
+    python-3.13-base=3.13.18_git20261030-r0 \
     libxml2-16=2.15.4-r2 libxslt=1.1.45-r5 xmlsec=1.3.13-r0 \
     xmlsec-openssl=1.3.13-r0
 
@@ -748,12 +752,29 @@ opentelemetry-api==1.45.1 --hash=sha256:b31553efa588ae44bc306f863c785c5333a9ecc0
 REQ
 
 /app/.venv/bin/python - <<'VERIFY_PYTHON'
-import hashlib, json, sys
+import hashlib, json, subprocess, sys
 from pathlib import Path
 original = json.loads(Path('/usr/share/build-info/upstream-python.json').read_text())
-assert list(sys.version_info[:3]) == original['version'] == [3, 13, 17]
-assert hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest() == original['binary_sha256']
-print('Runtime Python version and executable are unchanged from the pinned upstream image')
+assert original['version'] == [3, 13, 17]
+assert len(original['binary_sha256']) == 64
+assert list(sys.version_info[:3]) == [3, 13, 18]
+apk_version = '3.13.18_git20261030-r0'
+installed = subprocess.check_output(
+    ['apk', 'info', '-v'], text=True).splitlines()
+assert 'python-3.13-' + apk_version in installed
+assert 'python-3.13-base-' + apk_version in installed
+binary = Path(sys.executable).resolve()
+runtime = {
+    'version': list(sys.version_info[:3]),
+    'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+    'binary_path': str(binary),
+    'apk_version': apk_version,
+    'upstream_version': original['version'],
+    'upstream_binary_sha256': original['binary_sha256'],
+}
+assert runtime['binary_sha256'] != original['binary_sha256']
+Path('/usr/share/build-info/runtime-python.json').write_text(json.dumps(runtime, sort_keys=True))
+print('Runtime Python security update:', json.dumps(runtime, sort_keys=True))
 VERIFY_PYTHON
 
 # No dependency re-resolution: every added/replaced wheel is explicitly pinned.
@@ -805,13 +826,14 @@ assert m.version("filelock") == "4.2.4"
 PY
 
 # Backport public CPython security fixes while retaining the truthful OS version.
-# Source hashes guard this exact Wolfi build; stale bytecode is invalidated.
+# The guarded poplib/http.client sources also match Wolfi Python 3.13.18.
+# Keep these additional PSF fixes; source hashes reject drift and stale bytecode is invalidated.
 # https://github.com/python/cpython/commit/b234a2b67539f787e191d2ef19a7cbdce32874e7
 # https://github.com/python/cpython/commit/2eb2af805c156ca52b316bb4ced5e0ab3971d0ae
 # https://github.com/python/cpython/commit/9f52b443c002cccfb54bda0706a9276b6b4a109d
 /app/.venv/bin/python -B - <<'PY'
 #!/usr/bin/env python3
-"""Apply three official CPython fixes to the exact upstream Wolfi Python 3.13.17 build.
+"""Apply three official CPython fixes to hash-guarded Wolfi Python 3.13.18 sources.
 
 Upstream patches (PSF-licensed source remains otherwise unchanged):
   CVE-2025-15367: b234a2b67539f787e191d2ef19a7cbdce32874e7
@@ -1046,7 +1068,7 @@ ENV PATH="/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin
     PRISMA_CLI_QUERY_ENGINE_TYPE="binary" \
     PRISMA_OFFLINE_MODE="true"
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="1.106.6-oss-r4" \
+      org.opencontainers.image.version="1.106.6-oss-r5" \
       org.opencontainers.image.base.name="ghcr.io/berriai/litellm:v1.106.6" \
       org.opencontainers.image.base.digest="sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06" \
       org.opencontainers.image.description="Experimental LiteLLM 1.106.6 OSS rebuild with security patches; redistribution review and destination scan required"
