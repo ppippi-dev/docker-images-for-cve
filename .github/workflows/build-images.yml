@@ -141,7 +141,7 @@ jobs:
           import importlib.util
           from pathlib import Path
           from packaging.requirements import Requirement
-          assert metadata.version('litellm') == '1.106.6'
+          assert metadata.version('litellm') == '1.108.0'
           for module in ('litellm_enterprise', 'ddtrace', '_ddtrace_internal'):
               assert importlib.util.find_spec(module) is None
           names = {d.metadata['Name'].lower().replace('_', '-') for d in metadata.distributions()}
@@ -225,13 +225,13 @@ jobs:
 
           original = json.loads(Path('/usr/share/build-info/upstream-python.json').read_text())
           runtime = json.loads(Path('/usr/share/build-info/runtime-python.json').read_text())
-          assert original['version'] == [3, 13, 17]
+          assert original['version'] == [3, 13, 18]
           assert list(sys.version_info[:3]) == runtime['version'] == [3, 13, 18]
           assert runtime['upstream_version'] == original['version']
           assert runtime['upstream_binary_sha256'] == original['binary_sha256']
           assert runtime['apk_version'] == '3.13.18_git20261030-r0'
           assert hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest() == runtime['binary_sha256']
-          assert runtime['binary_sha256'] != original['binary_sha256']
+          assert runtime['binary_sha256'] == original['binary_sha256']
           print('Python:', sys.version)
           print('httpx:', metadata.version('httpx'), 'httpx2:', metadata.version('httpx2'))
           assert sys.version_info[:3] == (3, 13, 18)

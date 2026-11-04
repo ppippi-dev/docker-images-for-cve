@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 # LICENSE AND PUBLICATION NOTES
-# Experimental OSS-only rebuild of LiteLLM 1.106.6: Enterprise source/package
+# Experimental OSS-only rebuild of LiteLLM 1.108.0: Enterprise source/package
 # is removed and the Python/Rust wheel + UI are rebuilt from the pinned source.
 # Source manifest changes remove Enterprise and optional Datadog tracing
 # dependencies and backport the upstream filelock bound. No license gate is bypassed.
@@ -29,49 +29,45 @@
 # - Preserve upstream license notices; an image contains multiple licenses.
 #
 # Build (linux/amd64 only; no local build context is sent):
-#   docker build --platform linux/amd64 -t litellm-cve:1.106.6-oss-r5 - < litellm/Dockerfile
+#   docker build --platform linux/amd64 -t litellm-cve:1.108.0-oss-r1 - < litellm/Dockerfile
 # Optional HTTPS proxy CA: add --secret id=build_ca,src=/path/to/combined-ca.pem
 # The CA is a temporary BuildKit mount, never copied into an image layer.
 # Supplementary public scan (run outside this repository; Trivy 0.76.1):
 #   trivy image --scanners vuln --ignorefile '' --ignore-unfixed=false \
 #     --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
-#     litellm-cve:1.106.6-oss-r5
+#     litellm-cve:1.108.0-oss-r1
 # The destination's approved scanner must also accept the exact image. Trivy
 # alone does not establish acceptance by a different scanner or policy.
 # Run API/authentication, streaming, UI and fresh/existing DB checks as well.
 # Export only the exact validated image ID/digest, and re-scan before import.
 #
-# Baseline: public v1.106.6, linux/amd64, Trivy 0.76.1;
-# vulnerability DB updated 2026-11-03T19:16:30Z: 10 OS + 33 Python findings.
-# OS fixes: libexpat1 2.9.0-r0 -> 2.10.0-r0;
-#   py3-pip-wheel 26.2.2-r0 -> 26.2.2-r2;
-# Owner-authorized Python 3.13 security update:
-#   upstream 3.13.17_git20261023-r1 -> 3.13.18_git20261030-r0.
+# Baseline: public v1.108.0, linux/amd64, Trivy 0.76.1, 2026-11-04:
+#   0 OS + 0 Node + 16 Python findings. Preserve its Python 3.13.18 executable.
 # Public package/security sources: https://packages.wolfi.dev/os/
 #   https://packages.wolfi.dev/os/security.json
 #   https://github.com/wolfi-dev/os/blob/main/python-3.13.yaml
-# Record original and patched runtime versions/binary hashes for CI verification.
+# Record and compare original/final runtime versions and binary hashes for CI.
 # HTTPX 0.28.1+cvebackport.1 adds bounded decoding and multipart header validation.
 # References: https://github.com/pydantic/httpx2/security/advisories/GHSA-8xx6-hgc6-gc2m
 #             https://github.com/pydantic/httpx2/security/advisories/GHSA-h4x7-gw46-3wm6
 # CVE-2026-3479 is disputed; Python 3.13.18 is outside the PSF affected range.
 # https://github.com/psf/advisory-database/blob/main/advisories/python/PSF-2026-13.json
 # Optional Datadog tracing is removed from this basic Gateway build.
-# Main venv fixes: dnspython 2.8.0 -> 2.9.0; filelock 3.32.7 -> 4.2.4;
-#   pyasn1 0.6.4 -> 0.6.5; pypdf 6.21.2 -> 6.21.4; tornado 6.5.10 -> 6.6.
+# Main venv fix: filelock 3.32.7 -> 4.2.4. Upstream already supplies fixed
+# dnspython 2.9.1, pyasn1 0.6.5, pypdf 6.21.4 and tornado 6.6.
 # Admin venv fixes: PyJWT 2.14.0 -> 2.15.0;
 #   opentelemetry-api 1.44.0 -> 1.45.1.
 # Fix references are the public advisories for these versions and upstream:
 # https://github.com/BerriAI/litellm/commit/dacaaad72ed25663ad7f40941c48f653a45289be
 
 FROM ghcr.io/astral-sh/uv:0.11.7@sha256:240fb85ab0f263ef12f492d8476aa3a2e4e1e333f7d67fbdd923d00a506a516a AS uv
-FROM ghcr.io/berriai/litellm:v1.106.6@sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06 AS upstream
+FROM ghcr.io/berriai/litellm:v1.108.0@sha256:c560d317136880ea92d62334d4367ab10955b1af189dd3ea24f6551290b1d6c1 AS upstream
 
 # Only MIT UI directory + root LICENSE are extracted; enterprise/ never enters.
 FROM --platform=$BUILDPLATFORM node:24.19.0-alpine3.24@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43 AS oss-ui-builder
 ENV NEXT_TELEMETRY_DISABLED=1 npm_config_fund=false npm_config_audit=false
-ADD --checksum=sha256:17e8963fdf67cbfa8091628b1b9a42feb16553fcd9aa5d327963f1ab7727cfd2 \
-    https://codeload.github.com/BerriAI/litellm/tar.gz/61c6ab78393ef45683dd7d963d2a315bd845e20b /tmp/litellm-source.tar.gz
+ADD --checksum=sha256:190e57ef5ae1e0394c6bd2fc8cd6949a00cfeb2caf289d880aba6c9e8799c53d \
+    https://codeload.github.com/BerriAI/litellm/tar.gz/b48077ff9ef6b14dd3f188d020ee7f40e2c5ebca /tmp/litellm-source.tar.gz
 ADD --checksum=sha256:43c653384c39617756846ad405705061a78fb6bbddb2ced57ab79fb92e8af2a7 \
     https://registry.npmjs.org/npm/-/npm-11.10.0.tgz /tmp/npm.tar.gz
 COPY <<'OSS_UI_NOTICES' /tmp/prepare_artifact.mjs
@@ -85,14 +81,18 @@ const auditPath = path.resolve(process.argv[4] ?? path.join(ui, "ui-artifact-aud
 const out = path.join(ui, "out");
 const lockBytes = fs.readFileSync(path.join(ui, "package-lock.json"));
 const sha = (data) => crypto.createHash("sha256").update(data).digest("hex");
-if (sha(lockBytes) !== "e198baf51e5e84ea03989f45560d1fe29be14bf1498d0b7256298f1efb4da34a") {
-  throw new Error("Unexpected v1.106.6 UI package-lock.json");
+if (sha(lockBytes) !== "bbd49884806a0536f8198b32c9a29a9e9c1679a88e1a8678c5fe6c26320447ca") {
+  throw new Error("Unexpected v1.108.0 UI package-lock.json");
 }
 const lock = JSON.parse(lockBytes);
+const lensArchive = path.join(ui, "vendor/litellm-lens-ui-0.1.0-dev.0.tgz");
+if (sha(fs.readFileSync(lensArchive)) !== "edeb7c4876fe583874a5f9bab9033aa6c06f0d16eafbae56917d52e25fb96f45") {
+  throw new Error("Unexpected vendored Lens UI archive");
+}
 const packages = [];
 const notices = [
   "LiteLLM OSS UI third-party license notices",
-  "Built from BerriAI/litellm commit 61c6ab78393ef45683dd7d963d2a315bd845e20b.",
+  "Built from BerriAI/litellm commit b48077ff9ef6b14dd3f188d020ee7f40e2c5ebca.",
   "This conservative inventory includes installed build and application dependencies.",
   "An entry does not imply its package/native binary is in the static browser bundle.",
   "The upstream LiteLLM license is supplied separately as LICENSE.litellm.txt.",
@@ -109,6 +109,14 @@ for (const [relative, entry] of Object.entries(lock.packages)) {
     /^(licen[cs]e(?:[._-]|$)|notice(?:[._-]|$)|copying(?:[._-]|$))/i.test(name)
     && fs.statSync(path.join(dir, name)).isFile()
   ).sort();
+  if (pkg.name === "@litellm/lens-ui") {
+    // The vendored package also attributes its bundled coding-agent logos.
+    const logoNotice = "public/assets/logos/coding-agent-logos.LICENSE";
+    if (!licenseFiles.includes("LICENSE") || !fs.statSync(path.join(dir, logoNotice)).isFile()) {
+      throw new Error("Missing vendored Lens UI or logo license notice");
+    }
+    licenseFiles.push(logoNotice);
+  }
   const record = {
     path: relative, name: pkg.name, version: pkg.version,
     declared_license: entry.license ?? pkg.license ?? null,
@@ -146,7 +154,7 @@ for (const required of ["index.html", "login/index.html", "THIRD_PARTY_NOTICES.t
   if (!files.some((file) => file.path === required)) throw new Error("Missing UI artifact: " + required);
 }
 const audit = {
-  source_commit: "61c6ab78393ef45683dd7d963d2a315bd845e20b",
+  source_commit: "b48077ff9ef6b14dd3f188d020ee7f40e2c5ebca",
   package_lock_sha256: sha(lockBytes),
   application_source_modified: false,
   enterprise_directory_in_build_input: false,
@@ -172,16 +180,16 @@ set -eu
 export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
     mkdir -p /source /opt/npm; \
     tar -xzf /tmp/litellm-source.tar.gz -C /source \
-      litellm-61c6ab78393ef45683dd7d963d2a315bd845e20b/ui/litellm-dashboard \
-      litellm-61c6ab78393ef45683dd7d963d2a315bd845e20b/LICENSE; \
-    mv /source/litellm-61c6ab78393ef45683dd7d963d2a315bd845e20b/ui/litellm-dashboard /ui; \
-    cp /source/litellm-61c6ab78393ef45683dd7d963d2a315bd845e20b/LICENSE /ui/LICENSE.litellm.txt; \
+      litellm-b48077ff9ef6b14dd3f188d020ee7f40e2c5ebca/ui/litellm-dashboard \
+      litellm-b48077ff9ef6b14dd3f188d020ee7f40e2c5ebca/LICENSE; \
+    mv /source/litellm-b48077ff9ef6b14dd3f188d020ee7f40e2c5ebca/ui/litellm-dashboard /ui; \
+    cp /source/litellm-b48077ff9ef6b14dd3f188d020ee7f40e2c5ebca/LICENSE /ui/LICENSE.litellm.txt; \
     tar -xzf /tmp/npm.tar.gz --strip-components=1 -C /opt/npm; \
     test "$(node --version)" = v24.19.0; \
     test "$(node /opt/npm/bin/npm-cli.js --version)" = 11.10.0; \
-    test ! -e /source/litellm-61c6ab78393ef45683dd7d963d2a315bd845e20b/enterprise; \
+    test ! -e /source/litellm-b48077ff9ef6b14dd3f188d020ee7f40e2c5ebca/enterprise; \
     cd /ui; \
-    echo 'e198baf51e5e84ea03989f45560d1fe29be14bf1498d0b7256298f1efb4da34a  package-lock.json' | sha256sum -c -; \
+    echo 'bbd49884806a0536f8198b32c9a29a9e9c1679a88e1a8678c5fe6c26320447ca  package-lock.json' | sha256sum -c -; \
     node /opt/npm/bin/npm-cli.js ci --prefer-offline --ignore-scripts --no-audit --no-fund; \
     node /opt/npm/bin/npm-cli.js run build; \
     node /tmp/prepare_artifact.mjs /ui /ui/LICENSE.litellm.txt /ui-artifact-audit.json; \
@@ -211,8 +219,8 @@ fi
 mkdir -p /src /wheels
 python3 - <<'PY'
 import hashlib, json, pathlib, urllib.request
-source = 'https://codeload.github.com/BerriAI/litellm/tar.gz/61c6ab78393ef45683dd7d963d2a315bd845e20b'
-artifacts = [(source, pathlib.Path('/tmp/source.tar.gz'), '17e8963fdf67cbfa8091628b1b9a42feb16553fcd9aa5d327963f1ab7727cfd2')]
+source = 'https://codeload.github.com/BerriAI/litellm/tar.gz/b48077ff9ef6b14dd3f188d020ee7f40e2c5ebca'
+artifacts = [(source, pathlib.Path('/tmp/source.tar.gz'), '190e57ef5ae1e0394c6bd2fc8cd6949a00cfeb2caf289d880aba6c9e8799c53d')]
 with urllib.request.urlopen('https://pypi.org/pypi/maturin/1.15.0/json', timeout=120) as r:
     data = json.load(r)
 name = 'maturin-1.15.0-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl'
@@ -234,7 +242,7 @@ from pathlib import Path
 p = Path('pyproject.toml')
 s = p.read_text()
 for before, after in [
-    ('    "litellm-enterprise==0.1.76.post1",\n', ''),
+    ('    "litellm-enterprise==0.1.79",\n', ''),
     ('    "ddtrace>=4.8.2,<5.0",\n', ''),
     ('    "filelock>=3.16.1,<4.0",', '    "filelock>=3.16.1,<5",'),
 ]:
@@ -697,8 +705,8 @@ FROM upstream AS patched
 
 ARG TARGETARCH
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="1.106.6-oss-r5" \
-      org.opencontainers.image.description="Custom dependency remediation of LiteLLM 1.106.6 for linux/amd64; requires a fresh vulnerability scan before use"
+      org.opencontainers.image.version="1.108.0-oss-r1" \
+      org.opencontainers.image.description="Custom dependency remediation of LiteLLM 1.108.0 for linux/amd64; requires a fresh vulnerability scan before use"
 
 # uv exists only during this RUN; it is not installed in the resulting image.
 # Keep the upstream USER, PATH, ENTRYPOINT, CMD and application payload intact.
@@ -715,7 +723,7 @@ import hashlib, importlib.metadata as m, json, sys
 from pathlib import Path
 Path("/usr/share/build-info").mkdir(parents=True, exist_ok=True)
 Path("/usr/share/build-info/upstream-python.json").write_text(json.dumps({"version": list(sys.version_info[:3]), "binary_sha256": hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest()}))
-assert m.version("litellm") == "1.106.6"
+assert m.version("litellm") == "1.108.0"
 root = Path(m.distribution("litellm").locate_file("litellm"))
 hashes = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
           for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts}
@@ -726,19 +734,11 @@ PY
 
 apk add --no-cache --repositories-file /dev/null \
     --repository https://packages.wolfi.dev/os \
-    libexpat1=2.10.0-r0 \
-    py3-pip-wheel=26.2.2-r2 \
-    python-3.13=3.13.18_git20261030-r0 \
-    python-3.13-base=3.13.18_git20261030-r0 \
     libxml2-16=2.15.4-r2 libxslt=1.1.45-r5 xmlsec=1.3.13-r0 \
     xmlsec-openssl=1.3.13-r0
 
 cat > /tmp/patch-main.txt <<'REQ'
-dnspython==2.9.0 --hash=sha256:9a4aedb833c3c1b49214d04d44d3032ab7a9135f7c1d29a549b4ff78fd82fda9
 filelock==4.2.4 --hash=sha256:301241438c57936ef93f4243a94f2559022268bfcf9b375a9a72eb0f8db8358e
-pyasn1==0.6.5 --hash=sha256:4017b0fce125096b8573b39c989fdb1a4b19cf761e683398184550fea0e66587
-pypdf==6.21.4 --hash=sha256:33e4fb41ca352810eb4e9838aa0d82d6888a5f8bf682f43e99cce5faa666255c
-tornado==6.6 --hash=sha256:11bb97c00981eb8254e55bd6a5ad960c983ae343fef8ae3ae5584cd1fb70236a
 # Vendor fixes: CVE-2026-19407 (aiplatform), CVE-2026-90790 (a2a),
 # CVE-2026-49272 (oauthlib). google-genai is aiplatform's updated dependency.
 google-cloud-aiplatform==1.165.1 --hash=sha256:93874bd7993d1d901291595df693a8b9d4d7c89b93d4f41f8664d73f088dec89
@@ -755,7 +755,7 @@ REQ
 import hashlib, json, subprocess, sys
 from pathlib import Path
 original = json.loads(Path('/usr/share/build-info/upstream-python.json').read_text())
-assert original['version'] == [3, 13, 17]
+assert original['version'] == [3, 13, 18]
 assert len(original['binary_sha256']) == 64
 assert list(sys.version_info[:3]) == [3, 13, 18]
 apk_version = '3.13.18_git20261030-r0'
@@ -772,9 +772,9 @@ runtime = {
     'upstream_version': original['version'],
     'upstream_binary_sha256': original['binary_sha256'],
 }
-assert runtime['binary_sha256'] != original['binary_sha256']
+assert runtime['binary_sha256'] == original['binary_sha256']
 Path('/usr/share/build-info/runtime-python.json').write_text(json.dumps(runtime, sort_keys=True))
-print('Runtime Python security update:', json.dumps(runtime, sort_keys=True))
+print('Runtime Python preserved from the pinned upstream image:', json.dumps(runtime, sort_keys=True))
 VERIFY_PYTHON
 
 # No dependency re-resolution: every added/replaced wheel is explicitly pinned.
@@ -800,8 +800,8 @@ import base64, csv, hashlib, importlib.metadata as m, json, sys
 from pathlib import Path
 assert sys.version_info >= (3, 11)
 dist = m.distribution("litellm")
-assert dist.version == "1.106.6"
-relative = next(p for p in dist.files if str(p) == "litellm-1.106.6.dist-info/METADATA")
+assert dist.version == "1.108.0"
+relative = next(p for p in dist.files if str(p) == "litellm-1.108.0.dist-info/METADATA")
 metadata = Path(dist.locate_file(relative))
 record = metadata.with_name("RECORD")
 assert not record.with_name("RECORD.jws").exists()
@@ -1022,7 +1022,7 @@ import importlib.metadata as m
 import importlib.util
 from pathlib import Path
 from packaging.requirements import Requirement
-assert m.version('litellm') == '1.106.6'
+assert m.version('litellm') == '1.108.0'
 for module in ('litellm_enterprise', 'ddtrace', '_ddtrace_internal'):
     assert importlib.util.find_spec(module) is None
 assert all(Requirement(r).name.lower().replace('_', '-') not in {'litellm-enterprise', 'ddtrace', 'ddtrace-internal'}
@@ -1062,16 +1062,16 @@ FROM scratch
 COPY --from=oss-runtime / /
 ENV PATH="/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin" \
     SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt" \
-    LITELLM_RELEASE_TAG="v1.106.6" \
+    LITELLM_RELEASE_TAG="v1.108.0" \
     PRISMA_BINARY_CACHE_DIR="/opt/prisma/binaries" \
     PRISMA_CLI_PATH="/opt/prisma/binaries/node_modules/.bin/prisma" \
     PRISMA_CLI_QUERY_ENGINE_TYPE="binary" \
     PRISMA_OFFLINE_MODE="true"
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="1.106.6-oss-r5" \
-      org.opencontainers.image.base.name="ghcr.io/berriai/litellm:v1.106.6" \
-      org.opencontainers.image.base.digest="sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06" \
-      org.opencontainers.image.description="Experimental LiteLLM 1.106.6 OSS rebuild with security patches; redistribution review and destination scan required"
+      org.opencontainers.image.version="1.108.0-oss-r1" \
+      org.opencontainers.image.base.name="ghcr.io/berriai/litellm:v1.108.0" \
+      org.opencontainers.image.base.digest="sha256:c560d317136880ea92d62334d4367ab10955b1af189dd3ea24f6551290b1d6c1" \
+      org.opencontainers.image.description="Experimental LiteLLM 1.108.0 OSS rebuild with security patches; redistribution review and destination scan required"
 WORKDIR /app
 USER root
 EXPOSE 4000/tcp
