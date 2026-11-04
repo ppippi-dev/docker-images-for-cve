@@ -457,18 +457,112 @@ jobs:
           tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/trivy-bin" trivy
           "$RUNNER_TEMP/trivy-bin/trivy" --version
       - &scan
-        name: Block on any vulnerability or scan error
+        name: Scan all vulnerabilities and apply runtime publication policy
         shell: bash
         run: |
           set -euo pipefail
-          # Fresh per-job DB; no ignored CVEs, omitted severities or hidden package types.
+          # Scan every severity and package type. Exit 0 applies only to findings;
+          # scanner/process errors still stop the job before the policy runs.
           "$RUNNER_TEMP/trivy-bin/trivy" image \
             --config /dev/null --cache-dir "$RUNNER_TEMP/trivy-cache" \
             --scanners vuln --pkg-types os,library \
             --ignorefile '' --ignore-unfixed=false \
-            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 0 \
+            --format json --output "$RUNNER_TEMP/trivy-results.json" \
             --skip-db-update=false --skip-java-db-update=false --timeout 30m \
             "$LOCAL_IMAGE"
+          "$RUNNER_TEMP/trivy-bin/trivy" convert --format table "$RUNNER_TEMP/trivy-results.json"
+          python3 - <<'PYCODE'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          # The owner excludes language runtimes/compilers from the publication gate.
+          # This is an explicit package allowlist, not an exemption for a whole ecosystem.
+          # Unknown packages remain blocked until their identity is reviewed.
+          OS_TYPES = {'wolfi', 'chainguard', 'alpine', 'debian', 'ubuntu', 'redhat',
+                      'centos', 'rocky', 'alma', 'amazon', 'oracle', 'fedora'}
+          RUNTIMES = {
+              'Python': (r'(?:python(?:[23](?:\.\d+)?)?|python-[23](?:\.\d+)?)(?:-(?:base|minimal|stdlib|libs))?',
+                         r'libpython[23](?:\.\d+)?(?:-(?:minimal|stdlib))?'),
+              'Node.js': (r'nodejs(?:-?\d+(?:\.\d+)*)?(?:-(?:current|lts))?',),
+              'Java': (r'openjdk-?\d+(?:-(?:jre|jdk)(?:-(?:headless|base))?)?',
+                       r'java-\d+-openjdk(?:-(?:headless|devel))?'),
+              'Go': (r'(?:go|golang)(?:-?\d+(?:\.\d+)*)?(?:-go)?',),
+              'Rust': (r'(?:rust|rustc)(?:-?\d+(?:\.\d+)*)?',),
+              'Ruby': (r'ruby(?:-?\d+(?:\.\d+)*)?(?:-base)?',),
+              'PHP': (r'php(?:-?\d+(?:\.\d+)*)?(?:-(?:cli|fpm))?',),
+              'Perl': (r'perl(?:-?\d+(?:\.\d+)*)?(?:-base)?',),
+              '.NET': (r'dotnet-(?:sdk|runtime|host|hostfxr)(?:-\d+(?:\.\d+)*)?',),
+          }
+
+
+          def runtime_family(result, vulnerability):
+              name = vulnerability['PkgName']
+              if (result.get('Class'), result.get('Type'), name) == ('lang-pkgs', 'gobinary', 'stdlib'):
+                  return 'Go'
+              if result.get('Class') != 'os-pkgs' or result.get('Type') not in OS_TYPES:
+                  return None
+              for family, patterns in RUNTIMES.items():
+                  if any(re.fullmatch(pattern, name) for pattern in patterns):
+                      return family
+              return None
+
+
+          def main():
+              temp = Path(os.environ['RUNNER_TEMP'])
+              report = json.loads((temp / 'trivy-results.json').read_text())
+              expected = (temp / 'validated-image-id').read_text().strip()
+              assert report.get('SchemaVersion') == 2, 'Unexpected Trivy report schema'
+              assert report.get('ArtifactType') == 'container_image', 'Not a container image scan'
+              assert report.get('Metadata', {}).get('ImageID') == expected, 'Scan image differs from the validated image'
+              results = report.get('Results')
+              assert isinstance(results, list) and results, 'Missing scan results'
+              allowed, blocked = [], []
+              for result in results:
+                  assert isinstance(result, dict), 'Malformed scan target'
+                  for field in ('Target', 'Class', 'Type'):
+                      assert isinstance(result.get(field), str) and result[field], 'Incomplete scan target'
+                  findings = result.get('Vulnerabilities')
+                  if findings is None:
+                      findings = []
+                  assert isinstance(findings, list), 'Malformed vulnerability list'
+                  for finding in findings:
+                      assert isinstance(finding, dict), 'Malformed vulnerability'
+                      for field in ('VulnerabilityID', 'PkgName', 'InstalledVersion', 'Severity'):
+                          assert isinstance(finding.get(field), str) and finding[field], 'Incomplete vulnerability'
+                      family = runtime_family(result, finding)
+                      row = {'target': result['Target'], 'class': result['Class'], 'type': result['Type'],
+                             'package': finding['PkgName'], 'installed': finding['InstalledVersion'],
+                             'cve': finding['VulnerabilityID'], 'severity': finding['Severity'],
+                             'runtime': family}
+                      (allowed if family else blocked).append(row)
+                      print(('RUNTIME EXCEPTION ' if family else 'BLOCKED ') + json.dumps(row))
+              decision = {'runtime_exceptions': allowed, 'blocking_findings': blocked,
+                          'image_id': expected, 'publication_gate': 'blocked' if blocked else 'passed'}
+              (temp / 'vulnerability-policy-result.json').write_text(json.dumps(decision, indent=2) + '\n')
+              def cell(value):
+                  return str(value).replace('|', '\\|').replace('\r', ' ').replace('\n', ' ')
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write(f'Vulnerability policy: {len(allowed)} language-runtime exceptions, {len(blocked)} blocking findings.\n\n')
+                  if allowed or blocked:
+                      summary.write('| Decision | Package | Installed version | Vulnerability | Severity |\n|---|---|---|---|---|\n')
+                      for row in allowed + blocked:
+                          disposition = 'Runtime exception: ' + row['runtime'] if row['runtime'] else 'BLOCKED'
+                          summary.write('| ' + ' | '.join(cell(value) for value in
+                              (disposition, row['package'], row['installed'], row['cve'], row['severity'])) + ' |\n')
+                      summary.write('\nRuntime exceptions permit publication; they do not mean the vulnerabilities are fixed.\n')
+              if blocked:
+                  raise SystemExit('Non-runtime vulnerabilities block publication')
+              if allowed:
+                  print(f'::warning::{len(allowed)} language-runtime findings remain under the owner-selected publication exception.')
+              print('PASS publication vulnerability policy; scanner findings were retained without CVE filters')
+
+
+          if __name__ == '__main__':
+              main()
+          PYCODE
       - &identity
         name: Confirm the validated image was not replaced
         shell: bash

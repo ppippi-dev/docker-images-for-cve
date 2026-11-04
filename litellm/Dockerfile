@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-# REDISTRIBUTION HOLD
+# LICENSE AND PUBLICATION NOTES
 # Experimental OSS-only rebuild of LiteLLM 1.106.6: Enterprise source/package
 # is removed and the Python/Rust wheel + UI are rebuilt from the pinned source.
 # Source manifest changes remove Enterprise and optional Datadog tracing
@@ -21,8 +21,10 @@
 #   secret-valued ARG/ENV. Build from stdin with an empty context (command below).
 # - Keep tests, reports and exported images outside this repository. Never use
 #   CVE ignores, severity filtering or --ignore-unfixed to claim a clean image.
-# - Re-scan every candidate with a fresh vulnerability DB. Any finding or scan
-#   error blocks release/import. This recipe is not a permanent zero-CVE claim.
+# - Re-scan every candidate with a fresh vulnerability DB. Scanner errors and
+#   non-runtime vulnerabilities block publication. The owner permits identified
+#   language runtime/compiler findings; keep all findings visible. This is not
+#   a zero-CVE claim or an override of the destination import policy.
 # - Preserve upstream license notices; an image contains multiple licenses.
 #
 # Build (linux/amd64 only; no local build context is sent):
@@ -43,7 +45,8 @@
 # OS fixes: libexpat1 2.9.0-r0 -> 2.10.0-r0;
 #   py3-pip-wheel 26.2.2-r0 -> 26.2.2-r2;
 # Runtime Python stays at upstream 3.13.17_git20261023-r1 at the owner's request.
-# Python-version CVEs still block publication; none are ignored.
+# The owner permits Python/runtime CVEs for publication while keeping their
+# scan findings visible. Dependencies such as HTTPX remain subject to the gate.
 # HTTPX 0.28.1+cvebackport.1 adds bounded decoding and multipart header validation.
 # References: https://github.com/pydantic/httpx2/security/advisories/GHSA-8xx6-hgc6-gc2m
 #             https://github.com/pydantic/httpx2/security/advisories/GHSA-h4x7-gw46-3wm6
