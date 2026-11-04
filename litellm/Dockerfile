@@ -181,13 +181,19 @@ FROM rust:1.98-slim@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35f
 ENV RUSTUP_TOOLCHAIN=1.98.1
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     --mount=from=oss-ui-builder,source=/ui/out,target=/run/oss-ui \
-    --mount=type=secret,id=build_ca,target=/etc/ssl/certs/ca-certificates.crt <<'SCRIPT'
+    --mount=type=secret,id=build_ca <<'SCRIPT'
 set -eu
-if [ -s /etc/ssl/certs/ca-certificates.crt ]; then
-  export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
+if [ -s /run/secrets/build_ca ]; then
+  export SSL_CERT_FILE=/run/secrets/build_ca REQUESTS_CA_BUNDLE=/run/secrets/build_ca CARGO_HTTP_CAINFO=/run/secrets/build_ca
 fi
-apt-get update
-apt-get install -y --no-install-recommends python3 python3-dev pkg-config libssl-dev ca-certificates
+# Keep the temporary proxy CA separate from files apt may update.
+if [ -s /run/secrets/build_ca ]; then
+  apt-get -o Acquire::https::CaInfo=/run/secrets/build_ca update
+  apt-get -o Acquire::https::CaInfo=/run/secrets/build_ca install -y --no-install-recommends python3 python3-dev pkg-config libssl-dev ca-certificates
+else
+  apt-get update
+  apt-get install -y --no-install-recommends python3 python3-dev pkg-config libssl-dev ca-certificates
+fi
 mkdir -p /src /wheels
 python3 - <<'PY'
 import hashlib, json, pathlib, urllib.request
