@@ -75,7 +75,7 @@ jobs:
           try:
               status, _ = request(url, 'DELETE')
           except urllib.error.HTTPError as error:
-              last_version = 'You cannot delete the last version of a package. You must delete the package instead.'
+              last_version = 'You cannot delete the last tagged version of a package. You must delete the package instead.'
               if error.code != 400 or error.github_message != last_version:
                   raise
               # GitHub requires package deletion for its final version. Refuse
