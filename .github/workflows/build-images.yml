@@ -1,0 +1,339 @@
+# Add each OSS as <name>/Dockerfile with an org.opencontainers.image.version label.
+# Build contexts stay empty; no local configuration or internal reports are inputs.
+name: Build, scan and publish OSS images
+
+on:
+  push:
+    branches: [main]
+    paths: ['*/Dockerfile', '.github/workflows/build-images.yml']
+  pull_request:
+    paths: ['*/Dockerfile', '.github/workflows/build-images.yml']
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'OSS folder name, or all'
+        required: true
+        default: all
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Manual requests cannot replace pending automatic main builds or each other.
+  group: oss-images-${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.images.outputs.matrix }}
+      count: ${{ steps.images.outputs.count }}
+    steps:
+      # Official actions/checkout v7.0.1 tag resolved through GitHub's Git refs API.
+      - &checkout
+        name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Discover changed OSS Dockerfiles
+        id: images
+        env:
+          REQUESTED_IMAGE: ${{ inputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          event = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          name = os.environ['GITHUB_EVENT_NAME']
+          safe = re.compile(r'[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?\Z')
+          folders = []
+          for path in pathlib.Path('.').iterdir():
+              recipe = path / 'Dockerfile'
+              if not path.is_dir() or not recipe.is_file():
+                  continue
+              if path.is_symlink() or recipe.is_symlink() or not safe.fullmatch(path.name):
+                  raise SystemExit('OSS Dockerfiles require real folders with lowercase kebab-case names')
+              folders.append(path.name)
+          folders.sort()
+          if name == 'workflow_dispatch':
+              requested = os.environ.get('REQUESTED_IMAGE') or 'all'
+              if requested != 'all' and requested not in folders:
+                  raise SystemExit('Requested image must be all or an existing OSS folder')
+              selected = folders if requested == 'all' else [requested]
+          elif name == 'push':
+              # GitHub concurrency can replace a pending main run. Build the
+              # complete current state so an earlier OSS change cannot be lost.
+              selected = folders
+          else:
+              base, head = event['pull_request']['base']['sha'], event['pull_request']['head']['sha']
+              changed = None
+              if re.fullmatch(r'[0-9a-f]{40}', base) and base != '0' * 40:
+                  if not re.fullmatch(r'[0-9a-f]{40}', head):
+                      raise SystemExit('Unexpected commit identifier')
+                  result = subprocess.run(['git', 'diff', '--name-only', '-z', base, head],
+                                          check=False, capture_output=True)
+                  if result.returncode == 0:
+                      changed = set(result.stdout.decode().rstrip('\0').split('\0'))
+              # Unavailable PR history and changes to CI itself check every image.
+              if changed is None or '.github/workflows/build-images.yml' in changed:
+                  selected = folders
+              else:
+                  selected = [folder for folder in folders if folder + '/Dockerfile' in changed]
+          matrix = {'oss': selected}
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('matrix=' + json.dumps(matrix) + '\ncount=' + str(len(selected)) + '\n')
+          print('Selected OSS images: ' + ', '.join(selected))
+          PY
+
+  verify-pr:
+    name: Verify ${{ matrix.oss }} (no publishing)
+    if: >-
+      needs.discover.outputs.count != '0' &&
+      (github.event_name == 'pull_request' ||
+       (github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'))
+    needs: discover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      OSS: ${{ matrix.oss }}
+      LOCAL_IMAGE: ci-local/${{ matrix.oss }}:${{ github.sha }}
+    steps:
+      - *checkout
+      - &build
+        name: Build linux/amd64 with an empty context
+        shell: bash
+        env:
+          DOCKER_BUILDKIT: '1'
+        run: |
+          set -euo pipefail
+          [[ "$OSS" =~ ^[a-z0-9]+([a-z0-9-]*[a-z0-9])?$ ]]
+          test ! -L "$OSS"
+          test -f "$OSS/Dockerfile" && test ! -L "$OSS/Dockerfile"
+          docker build --pull --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$LOCAL_IMAGE" - < "$OSS/Dockerfile"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$LOCAL_IMAGE")" = linux/amd64
+          image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
+          [[ "$image_version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]
+          docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE" > "$RUNNER_TEMP/validated-image-id"
+      - &scanner
+        name: Install checksum-pinned Trivy 0.76.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          # SHA256 agrees with both the official release checksums file and
+          # the GitHub release asset API digest for v0.76.1 (Linux-64bit).
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 3 --output "$RUNNER_TEMP/trivy.tar.gz" \
+            https://github.com/aquasecurity/trivy/releases/download/v0.76.1/trivy_0.76.1_Linux-64bit.tar.gz
+          printf '%s  %s\n' c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0 \
+            "$RUNNER_TEMP/trivy.tar.gz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/trivy-bin" trivy
+          "$RUNNER_TEMP/trivy-bin/trivy" --version
+      - &scan
+        name: Block on any vulnerability or scan error
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fresh per-job DB; no ignored CVEs, omitted severities or hidden package types.
+          "$RUNNER_TEMP/trivy-bin/trivy" image \
+            --config /dev/null --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --scanners vuln --pkg-types os,library \
+            --ignorefile '' --ignore-unfixed=false \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
+            --skip-db-update=false --skip-java-db-update=false --timeout 30m \
+            "$LOCAL_IMAGE"
+      - &runtime
+        name: Verify LiteLLM API, authentication, streaming, UI and persistent database
+        if: matrix.oss == 'litellm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_dir="$RUNNER_TEMP/litellm-smoke"
+          mkdir -p "$smoke_dir"
+          chmod 700 "$smoke_dir"
+          cat > "$smoke_dir/config.yaml" <<'CONFIG'
+          model_list:
+            - model_name: mock
+              litellm_params:
+                model: openai/mock
+                api_key: sk-public-local-mock-only
+                mock_response: ok
+          general_settings:
+            master_key: os.environ/LITELLM_MASTER_KEY
+            database_url: os.environ/DATABASE_URL
+          CONFIG
+          # These fresh random values are for this isolated disposable test only.
+          master_key="sk-$(openssl rand -hex 24)"
+          db_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$master_key"
+          echo "::add-mask::$db_password"
+          docker pull postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+          docker network create --internal ci-smoke
+          docker run -d --name ci-postgres --network ci-smoke \
+            -e "POSTGRES_PASSWORD=$db_password" -e POSTGRES_DB=litellm postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
+          for attempt in $(seq 1 60); do
+            if docker exec ci-postgres pg_isready -U postgres -d litellm >/dev/null; then break; fi
+            sleep 2
+          done
+          docker exec ci-postgres pg_isready -U postgres -d litellm
+          # No external network, host ports, real provider credentials or company data.
+          docker run -d --name ci-proxy --network ci-smoke \
+            -e "DATABASE_URL=postgresql://postgres:$db_password@ci-postgres:5432/litellm" \
+            -e "LITELLM_MASTER_KEY=$master_key" -e LITELLM_LOCAL_MODEL_COST_MAP=True \
+            --mount "type=bind,src=$smoke_dir/config.yaml,dst=/ci/config.yaml,readonly" \
+            "$LOCAL_IMAGE" --config /ci/config.yaml --port 4000
+          cat > "$smoke_dir/check.py" <<'PY'
+          import json, os, pathlib, sys, time
+          import httpx
+          from urllib.parse import urljoin, urlsplit
+          key = os.environ['LITELLM_MASTER_KEY']
+          client = httpx.Client(base_url='http://127.0.0.1:4000', trust_env=False,
+                                timeout=30, follow_redirects=False)
+          def request(method, path, token=key, expected=200, **kwargs):
+              response = client.request(method, path,
+                  headers={'Authorization': 'Bearer ' + token} if token else {}, **kwargs)
+              allowed = (expected,) if isinstance(expected, int) else expected
+              assert response.status_code in allowed, path + ': HTTP ' + str(response.status_code)
+              return response
+          for attempt in range(120):
+              try:
+                  if client.get('/health/readiness', headers={'Authorization': 'Bearer ' + key}).status_code == 200:
+                      break
+              except httpx.HTTPError:
+                  pass
+              time.sleep(2)
+          else:
+              raise SystemExit('LiteLLM did not become ready')
+          for path in ('/health/liveliness', '/health/readiness'):
+              assert request('GET', path).content, 'empty health response'
+          saved = pathlib.Path('/tmp/ci-virtual-key')
+          payload = {'model': 'mock', 'messages': [{'role': 'user', 'content': 'public CI mock'}]}
+          if len(sys.argv) > 1 and sys.argv[1] == 'existing-db':
+              virtual_key = saved.read_text()
+              info = request('GET', '/key/info', params={'key': virtual_key}).json()
+              assert 'mock' in info['info']['models'], 'persisted key lost model authorization'
+              assert request('POST', '/v1/chat/completions', token=virtual_key,
+                             json=payload).json()['choices'][0]['message']['content'] == 'ok'
+              request('POST', '/key/delete', json={'keys': [virtual_key]})
+              saved.unlink()
+              print('PASS restarted proxy retains PostgreSQL key and serves authenticated mock')
+              raise SystemExit(0)
+          ui = request('GET', '/ui', token=None, expected=(200, 301, 302, 303, 307, 308))
+          for attempt in range(5):
+              if ui.status_code == 200:
+                  break
+              target = urlsplit(urljoin(str(ui.url), ui.headers['location']))
+              assert target.hostname == '127.0.0.1' and target.port == 4000 and target.scheme == 'http'
+              ui = request('GET', target.path, token=None, expected=(200, 301, 302, 303, 307, 308))
+          assert ui.status_code == 200 and b'<html' in ui.content.lower(), 'UI HTML missing'
+          for token in (None, 'sk-invalid-local-ci'):
+              request('POST', '/v1/chat/completions', token=token, json=payload, expected=(401, 403))
+          request('POST', '/key/generate', token=None, json={'models': ['mock']}, expected=(401, 403))
+          virtual_key = request('POST', '/key/generate',
+                                json={'models': ['mock'], 'duration': '1h'}).json()['key']
+          # Private temporary receipt survives proxy restart, not the CI job.
+          saved.touch(mode=0o600)
+          saved.write_text(virtual_key)
+          info = request('GET', '/key/info', params={'key': virtual_key}).json()
+          assert 'mock' in info['info']['models']
+          request('POST', '/key/update', json={'key': virtual_key, 'key_alias': 'public-ci-smoke'})
+          assert request('GET', '/key/info', params={'key': virtual_key}).json()['info']['key_alias'] == 'public-ci-smoke'
+          result = request('POST', '/v1/chat/completions', token=virtual_key, json=payload).json()
+          assert result['choices'][0]['message']['content'] == 'ok'
+          chunks, done = [], False
+          with client.stream('POST', '/v1/chat/completions',
+                  headers={'Authorization': 'Bearer ' + virtual_key}, json={**payload, 'stream': True}) as response:
+              assert response.status_code == 200
+              assert 'text/event-stream' in response.headers.get('content-type', '')
+              for line in response.iter_lines():
+                  if not line.startswith('data:'):
+                      continue
+                  data = line[5:].strip()
+                  if data == '[DONE]':
+                      done = True
+                      break
+                  event = json.loads(data)
+                  assert 'error' not in event
+                  chunks.extend(c.get('delta', {}).get('content') or '' for c in event.get('choices', []))
+          assert done and ''.join(chunks) == 'ok', 'SSE mock response mismatch'
+          print('PASS health, UI, auth, key create/read/update, nonstream and stream mock API')
+          PY
+          docker exec -i ci-proxy /app/.venv/bin/python - < "$smoke_dir/check.py"
+          docker restart ci-proxy
+          docker exec -i ci-proxy /app/.venv/bin/python - existing-db < "$smoke_dir/check.py"
+      - &cleanup
+        name: Remove disposable smoke resources
+        if: always() && matrix.oss == 'litellm'
+        shell: bash
+        run: |
+          docker rm -f ci-proxy ci-postgres >/dev/null 2>&1 || true
+          docker network rm ci-smoke >/dev/null 2>&1 || true
+      - &identity
+        name: Confirm the validated image was not replaced
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE")" = "$(cat "$RUNNER_TEMP/validated-image-id")"
+
+  publish-main:
+    name: Verify and publish ${{ matrix.oss }} (main)
+    if: >-
+      needs.discover.outputs.count != '0' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: discover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      OSS: ${{ matrix.oss }}
+      LOCAL_IMAGE: ci-local/${{ matrix.oss }}:${{ github.sha }}
+    steps:
+      - *checkout
+      - *build
+      - *scanner
+      - *scan
+      - *runtime
+      - *cleanup
+      - *identity
+      - name: Publish the exact validated image to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          registry_image="ghcr.io/${REGISTRY_OWNER,,}/$OSS"
+          image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
+          [[ "$image_version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]
+          # The auth directory is ephemeral and never added to the build context.
+          export DOCKER_CONFIG="$RUNNER_TEMP/ghcr-auth"
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
+          docker tag "$LOCAL_IMAGE" "$registry_image:$image_version"
+          docker tag "$LOCAL_IMAGE" "$registry_image:sha-$GITHUB_SHA"
+          docker push "$registry_image:$image_version"
+          docker push "$registry_image:sha-$GITHUB_SHA"
+          printf 'Published `%s:%s` and `%s:sha-%s` from the validated image.\n' \
+            "$registry_image" "$image_version" "$registry_image" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
