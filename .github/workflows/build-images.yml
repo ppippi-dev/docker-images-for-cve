@@ -126,6 +126,68 @@ jobs:
           image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
           [[ "$image_version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]
           docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE" > "$RUNNER_TEMP/validated-image-id"
+      - name: Verify Enterprise components are absent from LiteLLM
+        if: matrix.oss == 'litellm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -i --network none --entrypoint /app/.venv/bin/python "$LOCAL_IMAGE" - <<'PYCODE'
+          import importlib.metadata as metadata
+          import importlib.util
+          from pathlib import Path
+          from packaging.requirements import Requirement
+          assert metadata.version('litellm') == '1.106.6'
+          assert importlib.util.find_spec('litellm_enterprise') is None
+          names = {d.metadata['Name'].lower().replace('_', '-') for d in metadata.distributions()}
+          assert 'litellm-enterprise' not in names
+          assert all(Requirement(r).name.lower().replace('_', '-') != 'litellm-enterprise'
+                     for r in metadata.requires('litellm') or [])
+          assert not Path('/app/enterprise').exists()
+          root = Path(metadata.distribution('litellm').locate_file('litellm'))
+          assert not (root / 'proxy/enterprise').exists()
+          ui = root / 'proxy/_experimental/out'
+          assert (ui / 'LICENSE.litellm.txt').is_file()
+          assert (ui / 'THIRD_PARTY_NOTICES.txt').is_file()
+          from litellm.rust_bridge import _native
+          from litellm.proxy import proxy_server
+          assert proxy_server.enterprise_proxy_config is None
+          print('PASS absent Enterprise package/source/dependency; rebuilt OSS UI and Rust extension load')
+          PYCODE
+      - name: Check all exported layers for removed Enterprise paths
+        if: matrix.oss == 'litellm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/check-image-layers.py" <<'PYCODE'
+          import json, re, sys, tarfile
+          restricted = re.compile(r'^(?:[.]/)?app/enterprise(/|$)|(^|/)site-packages/litellm_enterprise(/|$)|(^|/)site-packages/litellm_enterprise-[^/]+[.]dist-info(/|$)|(^|/)litellm/proxy/enterprise(/|$)')
+          inspected, declared = set(), set()
+          entries = 0
+          with tarfile.open(fileobj=sys.stdin.buffer, mode='r|') as image:
+              for item in image:
+                  if not item.isfile():
+                      continue
+                  if item.name == 'manifest.json':
+                      for manifest in json.load(image.extractfile(item)):
+                          declared.update(manifest['Layers'])
+                  elif item.name.endswith('.tar') or re.fullmatch(r'blobs/sha256/[0-9a-f]{64}', item.name):
+                      # Docker save may use extensionless OCI blobs. JSON config
+                      # blobs are not tar archives; every declared layer must be.
+                      try:
+                          layer = tarfile.open(fileobj=image.extractfile(item), mode='r|*')
+                      except tarfile.ReadError:
+                          continue
+                      with layer:
+                          for member in layer:
+                              entries += 1
+                              if restricted.search(member.name):
+                                  raise SystemExit('Restricted Enterprise path retained in an image layer: ' + member.name)
+                      inspected.add(item.name)
+          assert declared and declared <= inspected, 'Not every manifest layer was inspected'
+          assert entries > 1000, 'No complete image payload inspected'
+          print(f'PASS {len(declared)} image layers / {entries} entries contain no restricted Enterprise paths')
+          PYCODE
+          docker save "$LOCAL_IMAGE" | python3 "$RUNNER_TEMP/check-image-layers.py"
       - name: Install checksum-pinned Trivy 0.76.1
         shell: bash
         run: |

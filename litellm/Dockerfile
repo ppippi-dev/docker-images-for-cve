@@ -1,11 +1,14 @@
 # syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 # REDISTRIBUTION HOLD
-# This recipe inherits Enterprise-licensed code from the official image.
-# Publishing this Dockerfile does not grant redistribution rights to that code.
-# Do not publish the built image until redistribution rights are established
-# or a separately reviewed build excludes the restricted components.
-# https://github.com/BerriAI/litellm/blob/v1.106.6/enterprise/LICENSE.md
+# Experimental OSS-only rebuild of LiteLLM 1.106.6: Enterprise source/package
+# is removed and the Python/Rust wheel + UI are rebuilt from the pinned source.
+# Core source changes are limited to the Enterprise dependency removal and the
+# documented upstream filelock bound. Enterprise license gates are not bypassed.
+# This does not make the complete image MIT-licensed: its OS, Python, Rust and
+# JavaScript dependencies retain their own license/source-distribution duties.
+# CI builds and validates only. Do not publish until redistribution review is
+# complete; a successful CVE scan or functional test is not license clearance.
 #
 # PUBLIC REPOSITORY RULES
 # - Track <open-source-name>/Dockerfile and reviewed build workflows only.
@@ -22,13 +25,13 @@
 # - Preserve upstream license notices; an image contains multiple licenses.
 #
 # Build (linux/amd64 only; no local build context is sent):
-#   docker build --platform linux/amd64 -t litellm-cve:1.106.6-r2 - < litellm/Dockerfile
+#   docker build --platform linux/amd64 -t litellm-cve:1.106.6-oss-r3 - < litellm/Dockerfile
 # Optional HTTPS proxy CA: add --secret id=build_ca,src=/path/to/combined-ca.pem
 # The CA is a temporary BuildKit mount, never copied into an image layer.
 # Supplementary public scan (run outside this repository; Trivy 0.76.1):
 #   trivy image --scanners vuln --ignorefile '' --ignore-unfixed=false \
 #     --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
-#     litellm-cve:1.106.6-r2
+#     litellm-cve:1.106.6-oss-r3
 # The destination's approved scanner must also accept the exact image. Trivy
 # alone does not establish acceptance by a different scanner or policy.
 # Run API/authentication, streaming, UI and fresh/existing DB checks as well.
@@ -49,6 +52,183 @@
 
 FROM ghcr.io/astral-sh/uv:0.11.7@sha256:240fb85ab0f263ef12f492d8476aa3a2e4e1e333f7d67fbdd923d00a506a516a AS uv
 FROM ghcr.io/berriai/litellm:v1.106.6@sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06 AS upstream
+
+# Only MIT UI directory + root LICENSE are extracted; enterprise/ never enters.
+FROM --platform=$BUILDPLATFORM node:24.19.0-alpine3.24@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43 AS oss-ui-builder
+ENV NEXT_TELEMETRY_DISABLED=1 npm_config_fund=false npm_config_audit=false
+ADD --checksum=sha256:17e8963fdf67cbfa8091628b1b9a42feb16553fcd9aa5d327963f1ab7727cfd2 \
+    https://codeload.github.com/BerriAI/litellm/tar.gz/61c6ab78393ef45683dd7d963d2a315bd845e20b /tmp/litellm-source.tar.gz
+ADD --checksum=sha256:43c653384c39617756846ad405705061a78fb6bbddb2ced57ab79fb92e8af2a7 \
+    https://registry.npmjs.org/npm/-/npm-11.10.0.tgz /tmp/npm.tar.gz
+COPY <<'OSS_UI_NOTICES' /tmp/prepare_artifact.mjs
+// Offline preparation; application source and license gates remain unchanged.
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+const ui = path.resolve(process.argv[2] ?? process.cwd());
+const license = path.resolve(process.argv[3] ?? path.join(ui, "LICENSE.litellm.txt"));
+const auditPath = path.resolve(process.argv[4] ?? path.join(ui, "ui-artifact-audit.json"));
+const out = path.join(ui, "out");
+const lockBytes = fs.readFileSync(path.join(ui, "package-lock.json"));
+const sha = (data) => crypto.createHash("sha256").update(data).digest("hex");
+if (sha(lockBytes) !== "e198baf51e5e84ea03989f45560d1fe29be14bf1498d0b7256298f1efb4da34a") {
+  throw new Error("Unexpected v1.106.6 UI package-lock.json");
+}
+const lock = JSON.parse(lockBytes);
+const packages = [];
+const notices = [
+  "LiteLLM OSS UI third-party license notices",
+  "Built from BerriAI/litellm commit 61c6ab78393ef45683dd7d963d2a315bd845e20b.",
+  "This conservative inventory includes installed build and application dependencies.",
+  "An entry does not imply its package/native binary is in the static browser bundle.",
+  "The upstream LiteLLM license is supplied separately as LICENSE.litellm.txt.",
+  "",
+];
+for (const [relative, entry] of Object.entries(lock.packages)) {
+  if (!relative.startsWith("node_modules/")) continue;
+  const dir = path.join(ui, relative);
+  const pkgFile = path.join(dir, "package.json");
+  if (!fs.existsSync(pkgFile)) continue;
+  const pkg = JSON.parse(fs.readFileSync(pkgFile, "utf8"));
+  if (pkg.version !== entry.version) throw new Error("Installed dependency differs from lock: " + relative);
+  const licenseFiles = fs.readdirSync(dir).filter((name) =>
+    /^(licen[cs]e(?:[._-]|$)|notice(?:[._-]|$)|copying(?:[._-]|$))/i.test(name)
+    && fs.statSync(path.join(dir, name)).isFile()
+  ).sort();
+  const record = {
+    path: relative, name: pkg.name, version: pkg.version,
+    declared_license: entry.license ?? pkg.license ?? null,
+    dev: Boolean(entry.dev), optional: Boolean(entry.optional),
+    license_files: licenseFiles,
+  };
+  packages.push(record);
+  notices.push("=".repeat(78), record.name + "@" + record.version,
+    "Declared license: " + JSON.stringify(record.declared_license));
+  if (licenseFiles.length === 0) notices.push("No top-level license/notice file; see declared license metadata.");
+  for (const name of licenseFiles) {
+    notices.push("--- " + relative + "/" + name + " ---", fs.readFileSync(path.join(dir, name), "utf8"));
+  }
+}
+fs.copyFileSync(license, path.join(out, "LICENSE.litellm.txt"));
+fs.writeFileSync(path.join(out, "THIRD_PARTY_NOTICES.txt"), notices.join("\n") + "\n");
+function walk(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))
+    .flatMap((entry) => {
+      const item = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) throw new Error("Unexpected artifact symlink: " + item);
+      return entry.isDirectory() ? walk(item) : [item];
+    });
+}
+const files = walk(out).map((file) => {
+  const relative = path.relative(out, file).split(path.sep).join("/");
+  if (relative.split("/").some((part) => part === "node_modules" || part === "enterprise")) {
+    throw new Error("Unexpected build/commercial source in artifact: " + relative);
+  }
+  if (/(^|\/)package(-lock)?\.json$/.test(relative)) throw new Error("Source manifest in artifact: " + relative);
+  const data = fs.readFileSync(file);
+  return { path: relative, bytes: data.length, sha256: sha(data) };
+});
+for (const required of ["index.html", "login/index.html", "THIRD_PARTY_NOTICES.txt", "LICENSE.litellm.txt"]) {
+  if (!files.some((file) => file.path === required)) throw new Error("Missing UI artifact: " + required);
+}
+const audit = {
+  source_commit: "61c6ab78393ef45683dd7d963d2a315bd845e20b",
+  package_lock_sha256: sha(lockBytes),
+  application_source_modified: false,
+  enterprise_directory_in_build_input: false,
+  enterprise_override_executed: false,
+  enterprise_feature_license_gates_modified: false,
+  scope_note: "MIT UI can contain Enterprise upsell text/conditional UI; this is distinct from commercial enterprise/ source.",
+  license_inventory_scope: "All installed lock entries, not a browser-bundle dependency proof or complete legal review.",
+  installed_dependencies_without_top_level_license_files: packages.filter((pkg) => pkg.license_files.length === 0).map((pkg) => pkg.path),
+  packages, files,
+};
+fs.writeFileSync(auditPath, JSON.stringify(audit, null, 2) + "\n");
+console.log(JSON.stringify({
+  artifact_files: files.length, artifact_bytes: files.reduce((sum, file) => sum + file.bytes, 0),
+  installed_packages: packages.length,
+  missing_top_level_license_files: audit.installed_dependencies_without_top_level_license_files.length,
+  audit: auditPath,
+}));
+OSS_UI_NOTICES
+# One RUN prevents vfs from retaining/copying a node_modules-sized intermediate layer.
+RUN --mount=type=secret,id=build_ca,target=/etc/ssl/certs/ca-certificates.crt \
+    <<'UIBUILD'
+set -eu
+export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+    mkdir -p /source /opt/npm; \
+    tar -xzf /tmp/litellm-source.tar.gz -C /source \
+      litellm-61c6ab78393ef45683dd7d963d2a315bd845e20b/ui/litellm-dashboard \
+      litellm-61c6ab78393ef45683dd7d963d2a315bd845e20b/LICENSE; \
+    mv /source/litellm-61c6ab78393ef45683dd7d963d2a315bd845e20b/ui/litellm-dashboard /ui; \
+    cp /source/litellm-61c6ab78393ef45683dd7d963d2a315bd845e20b/LICENSE /ui/LICENSE.litellm.txt; \
+    tar -xzf /tmp/npm.tar.gz --strip-components=1 -C /opt/npm; \
+    test "$(node --version)" = v24.19.0; \
+    test "$(node /opt/npm/bin/npm-cli.js --version)" = 11.10.0; \
+    test ! -e /source/litellm-61c6ab78393ef45683dd7d963d2a315bd845e20b/enterprise; \
+    cd /ui; \
+    echo 'e198baf51e5e84ea03989f45560d1fe29be14bf1498d0b7256298f1efb4da34a  package-lock.json' | sha256sum -c -; \
+    node /opt/npm/bin/npm-cli.js ci --prefer-offline --ignore-scripts --no-audit --no-fund; \
+    node /opt/npm/bin/npm-cli.js run build; \
+    node /tmp/prepare_artifact.mjs /ui /ui/LICENSE.litellm.txt /ui-artifact-audit.json; \
+    mkdir /ui-payload; mv /ui/out /ui-payload/out; \
+    rm -rf /source /ui /opt/npm /root/.npm /tmp/litellm-source.tar.gz /tmp/npm.tar.gz /tmp/prepare_artifact.mjs; \
+    mv /ui-payload /ui
+UIBUILD
+
+FROM rust:1.98-slim@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 AS oss-wheel-builder
+# This immutable builder contains Rust 1.98.1; avoid rustup fetching 1.98.0.
+ENV RUSTUP_TOOLCHAIN=1.98.1
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=from=oss-ui-builder,source=/ui/out,target=/run/oss-ui \
+    --mount=type=secret,id=build_ca,target=/etc/ssl/certs/ca-certificates.crt <<'SCRIPT'
+set -eu
+if [ -s /etc/ssl/certs/ca-certificates.crt ]; then
+  export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
+fi
+apt-get update
+apt-get install -y --no-install-recommends python3 python3-dev pkg-config libssl-dev ca-certificates
+mkdir -p /src /wheels
+python3 - <<'PY'
+import hashlib, json, pathlib, urllib.request
+source = 'https://codeload.github.com/BerriAI/litellm/tar.gz/61c6ab78393ef45683dd7d963d2a315bd845e20b'
+artifacts = [(source, pathlib.Path('/tmp/source.tar.gz'), '17e8963fdf67cbfa8091628b1b9a42feb16553fcd9aa5d327963f1ab7727cfd2')]
+with urllib.request.urlopen('https://pypi.org/pypi/maturin/1.15.0/json', timeout=120) as r:
+    data = json.load(r)
+name = 'maturin-1.15.0-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl'
+entry = next(f for f in data['urls'] if f['filename'] == name)
+artifacts.append((entry['url'], pathlib.Path('/tmp') / name, '653020a63525bb224e5ab0adf02e17a2e08bc86dbea7fc1399c9a56d7529b99e'))
+for url, path, expected in artifacts:
+    with urllib.request.urlopen(url, timeout=120) as src, path.open('wb') as dst:
+        digest = hashlib.sha256()
+        while chunk := src.read(1024 * 1024):
+            digest.update(chunk)
+            dst.write(chunk)
+    if digest.hexdigest() != expected:
+        raise SystemExit('SHA-256 mismatch: ' + str(path))
+PY
+tar -xzf /tmp/source.tar.gz -C /src --strip-components=1
+cd /src
+python3 - <<'PY'
+from pathlib import Path
+p = Path('pyproject.toml')
+s = p.read_text()
+for before, after in [
+    ('    "litellm-enterprise==0.1.76.post1",\n', ''),
+    ('    "filelock>=3.16.1,<4.0",', '    "filelock>=3.16.1,<5",'),
+]:
+    if s.count(before) != 1:
+        raise SystemExit('unexpected source manifest: ' + before.strip())
+    s = s.replace(before, after, 1)
+p.write_text(s)
+PY
+rm -rf enterprise litellm/proxy/enterprise litellm/proxy/_experimental/out
+cp -a /run/oss-ui litellm/proxy/_experimental/out
+mkdir -p /source-notices
+cp LICENSE pyproject.toml /source-notices/
+uv --no-config --no-cache tool run --from /tmp/maturin-1.15.0-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl maturin build --release --locked --interpreter /usr/bin/python3 --out /wheels
+rm -rf /src /tmp/source.tar.gz /tmp/maturin-*.whl /root/.cargo/registry /root/.cache/uv /var/lib/apt/lists/*
+SCRIPT
 
 # Rebuild both XML bindings against the same patched native libraries. Updating
 # only lxml can leave xmlsec's bundled libxml2 behind or create an ABI mismatch.
@@ -109,7 +289,7 @@ FROM upstream AS patched
 
 ARG TARGETARCH
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="1.106.6-r2" \
+      org.opencontainers.image.version="1.106.6-oss-r3" \
       org.opencontainers.image.description="Custom dependency remediation of LiteLLM 1.106.6 for linux/amd64; requires a fresh vulnerability scan before use"
 
 # uv exists only during this RUN; it is not installed in the resulting image.
@@ -385,11 +565,45 @@ rm -rf /app/enterprise/dist /app/litellm-proxy-extras/dist
 rm /tmp/patch-main.txt /tmp/patch-admin.txt /tmp/litellm-payload-before.json
 SH
 
+# Replace the upstream application with the source-built OSS wheel. Reinstalling
+# the original wheel/proxy extra would restore the Enterprise dependency.
+FROM patched AS oss-runtime
+RUN --mount=from=uv,source=/uv,target=/run/uv \
+    --mount=from=oss-wheel-builder,source=/wheels,target=/run/oss-wheels \
+    --mount=from=oss-wheel-builder,source=/source-notices,target=/run/source-notices <<'OSS_RUNTIME'
+set -eu
+/run/uv --no-config pip uninstall --python /app/.venv/bin/python litellm-enterprise
+rm -rf /app/enterprise /app/litellm/proxy/_experimental/out
+/run/uv --no-config --no-cache pip install --python /app/.venv/bin/python \
+    --no-deps --no-index --reinstall /run/oss-wheels/litellm-*.whl
+mkdir -p /usr/share/licenses/litellm-oss
+cp /run/source-notices/LICENSE /usr/share/licenses/litellm-oss/LICENSE
+cp /run/source-notices/pyproject.toml /usr/share/licenses/litellm-oss/pyproject.toml
+/app/.venv/bin/python - <<'PYCODE'
+import importlib.metadata as m
+import importlib.util
+from pathlib import Path
+from packaging.requirements import Requirement
+assert m.version('litellm') == '1.106.6'
+assert importlib.util.find_spec('litellm_enterprise') is None
+assert all(Requirement(r).name.lower().replace('_', '-') != 'litellm-enterprise'
+           for r in m.requires('litellm') or [])
+assert not Path('/app/enterprise').exists()
+root = Path(m.distribution('litellm').locate_file('litellm'))
+assert not (root / 'proxy/enterprise').exists()
+assert (root / 'proxy/_experimental/out/THIRD_PARTY_NOTICES.txt').is_file()
+from litellm.rust_bridge import _native
+print('Source-built OSS wheel and Rust extension verified')
+PYCODE
+/run/uv --no-config pip check --python /app/.venv/bin/python
+/run/uv --no-config pip check --python /opt/liteadmin/bin/python
+OSS_RUNTIME
+
 # Export only the patched filesystem. Replaced libraries and removed archives
 # are physically absent from the distributable layers, including old layers.
 # No package database, license notice or installed version is hidden from scans.
 FROM scratch
-COPY --from=patched / /
+COPY --from=oss-runtime / /
 ENV PATH="/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin" \
     SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt" \
     LITELLM_RELEASE_TAG="v1.106.6" \
@@ -398,10 +612,10 @@ ENV PATH="/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin
     PRISMA_CLI_QUERY_ENGINE_TYPE="binary" \
     PRISMA_OFFLINE_MODE="true"
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="1.106.6-r2" \
+      org.opencontainers.image.version="1.106.6-oss-r3" \
       org.opencontainers.image.base.name="ghcr.io/berriai/litellm:v1.106.6" \
       org.opencontainers.image.base.digest="sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06" \
-      org.opencontainers.image.description="LiteLLM 1.106.6 with pinned dependency fixes and documented CPython backports; validate with the destination scanner"
+      org.opencontainers.image.description="Experimental LiteLLM 1.106.6 OSS rebuild with security patches; redistribution review and destination scan required"
 WORKDIR /app
 USER root
 EXPOSE 4000/tcp
