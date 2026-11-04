@@ -26,13 +26,13 @@
 # - Preserve upstream license notices; an image contains multiple licenses.
 #
 # Build (linux/amd64 only; no local build context is sent):
-#   docker build --platform linux/amd64 -t litellm-cve:1.106.6-oss-r3 - < litellm/Dockerfile
+#   docker build --platform linux/amd64 -t litellm-cve:1.106.6-oss-r4 - < litellm/Dockerfile
 # Optional HTTPS proxy CA: add --secret id=build_ca,src=/path/to/combined-ca.pem
 # The CA is a temporary BuildKit mount, never copied into an image layer.
 # Supplementary public scan (run outside this repository; Trivy 0.76.1):
 #   trivy image --scanners vuln --ignorefile '' --ignore-unfixed=false \
 #     --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
-#     litellm-cve:1.106.6-oss-r3
+#     litellm-cve:1.106.6-oss-r4
 # The destination's approved scanner must also accept the exact image. Trivy
 # alone does not establish acceptance by a different scanner or policy.
 # Run API/authentication, streaming, UI and fresh/existing DB checks as well.
@@ -42,7 +42,13 @@
 # vulnerability DB updated 2026-11-03T19:16:30Z: 10 OS + 33 Python findings.
 # OS fixes: libexpat1 2.9.0-r0 -> 2.10.0-r0;
 #   py3-pip-wheel 26.2.2-r0 -> 26.2.2-r2;
-#   python-3.13{,-base} 3.13.17_git20261023-r1 -> 3.13.18_git20261030-r0.
+# Runtime Python stays at upstream 3.13.17_git20261023-r1 at the owner's request.
+# Python-version CVEs still block publication; none are ignored.
+# HTTPX 0.28.1+cvebackport.1 adds bounded decoding and multipart header validation.
+# References: https://github.com/pydantic/httpx2/security/advisories/GHSA-8xx6-hgc6-gc2m
+#             https://github.com/pydantic/httpx2/security/advisories/GHSA-h4x7-gw46-3wm6
+# CVE-2026-3479 is disputed; upstream Python 3.13.17 is outside the PSF affected range.
+# https://github.com/psf/advisory-database/blob/main/advisories/python/PSF-2026-13.json
 # Optional Datadog tracing is removed from this basic Gateway build.
 # Main venv fixes: dnspython 2.8.0 -> 2.9.0; filelock 3.32.7 -> 4.2.4;
 #   pyasn1 0.6.4 -> 0.6.5; pypdf 6.21.2 -> 6.21.4; tornado 6.5.10 -> 6.6.
@@ -293,25 +299,415 @@ export CFLAGS="-O2 -g0"
     --python /opt/xml-build/bin/python --out-dir /wheels /tmp/xml-source/xmlsec-1.3.17
 SH
 
+# Build a BSD-licensed HTTPX downstream wheel from checksum-pinned public source.
+# HTTPX2 CVE fixes are backported to HTTPX; these are separate distributions.
+FROM upstream AS httpx-wheel-builder
+RUN --mount=from=uv,source=/uv,target=/run/uv --mount=type=secret,id=build_ca,target=/etc/ssl/certs/ca-certificates.crt <<'SCRIPT'
+set -eu
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+apk add --no-cache --repositories-file /dev/null --repository https://packages.wolfi.dev/os patch=2.8.1-r1
+mkdir -p /tmp/httpx-source /wheels
+/usr/bin/python3.13 - <<'PYTHON'
+import hashlib, io, tarfile, urllib.request
+url = 'https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz'
+with urllib.request.urlopen(url, timeout=120) as response: data=response.read()
+assert hashlib.sha256(data).hexdigest() == '75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc'
+with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive: archive.extractall('/tmp/httpx-source', filter='data')
+PYTHON
+cd /tmp/httpx-source/httpx-0.28.1
+patch --batch --fuzz=0 -p1 <<'HTTPX_PATCH'
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -36 +36,2 @@
+-dynamic = ["readme", "version"]
++version = "0.28.1+cvebackport.1"
++dynamic = ["readme"]
+@@ -40,2 +41,2 @@
+-    "brotli; platform_python_implementation == 'CPython'",
+-    "brotlicffi; platform_python_implementation != 'CPython'",
++    "brotli>=1.2.0; platform_python_implementation == 'CPython'",
++    "brotlicffi>=1.2.0.2; platform_python_implementation != 'CPython'",
+@@ -55 +56 @@
+-  "zstandard>=0.18.0",
++  "backports-zstd>=1.0.0; python_version < '3.14'",
+--- a/httpx/__version__.py
++++ b/httpx/__version__.py
+@@ -3 +3 @@
+-__version__ = "0.28.1"
++__version__ = "0.28.1+cvebackport.1"
+--- a/httpx/_decoders.py
++++ b/httpx/_decoders.py
+@@ -10,0 +11,2 @@
++import itertools
++import sys
+@@ -29,5 +31,50 @@
+-# Zstandard support is optional
+-try:
+-    import zstandard
+-except ImportError:  # pragma: no cover
+-    zstandard = None  # type: ignore
++# Zstandard support is optional on Python <= 3.13.
++# On Python 3.14+, the stdlib includes an optional built-in zstd implementation.
++if typing.TYPE_CHECKING:
++    if sys.version_info >= (3, 14):
++        from compression.zstd import ZstdDecompressor, ZstdError
++    else:
++        from backports.zstd import ZstdDecompressor, ZstdError
++
++    _zstandard_installed: bool
++else:  # pragma: no cover
++    try:
++        if sys.version_info >= (3, 14):
++            from compression.zstd import ZstdDecompressor, ZstdError
++        else:
++            from backports.zstd import ZstdDecompressor, ZstdError
++
++        _zstandard_installed = True
++    except ImportError:
++        _zstandard_installed = False
++
++
++MAX_DECODE_CHUNK_SIZE = 2**20  # 1 MiB
++
++
++class Decompressor(typing.Protocol):
++    @property
++    def unconsumed_tail(self) -> bytes: ...
++
++    def decompress(self, data: bytes, max_length: int) -> bytes: ...
++
++    def flush(self) -> bytes: ...
++
++
++class ZlibDecompressor:
++    """
++    Drain a `zlib`/`gzip` decompressor in bounded pieces so a small compressed
++    input cannot inflate to an unbounded buffer in a single call.
++    """
++
++    def __init__(self, decompressor: Decompressor) -> None:
++        self.decompressor = decompressor
++
++    def decompress(self, data: bytes) -> typing.Iterator[bytes]:
++        decompressed = self.decompressor.decompress(data, MAX_DECODE_CHUNK_SIZE)
++        while decompressed:
++            yield decompressed
++            decompressed = self.decompressor.decompress(self.decompressor.unconsumed_tail, MAX_DECODE_CHUNK_SIZE)
++
++    def flush(self) -> bytes:
++        return self.decompressor.flush()
+@@ -37 +84 @@
+-    def decode(self, data: bytes) -> bytes:
++    def decode(self, data: bytes) -> typing.Iterator[bytes]:
+@@ -40 +87 @@
+-    def flush(self) -> bytes:
++    def flush(self) -> typing.Iterator[bytes]:
+@@ -49,5 +96,5 @@
+-    def decode(self, data: bytes) -> bytes:
+-        return data
+-
+-    def flush(self) -> bytes:
+-        return b""
++    def decode(self, data: bytes) -> typing.Iterator[bytes]:
++        yield data
++
++    def flush(self) -> typing.Iterator[bytes]:
++        yield from ()
+@@ -65,3 +112,3 @@
+-        self.decompressor = zlib.decompressobj()
+-
+-    def decode(self, data: bytes) -> bytes:
++        self.decompressor = ZlibDecompressor(zlib.decompressobj())
++
++    def decode(self, data: bytes) -> typing.Iterator[bytes]:
+@@ -71 +118 @@
+-            return self.decompressor.decompress(data)
++            yield from self.decompressor.decompress(data)
+@@ -74,7 +121,8 @@
+-                self.decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+-                return self.decode(data)
+-            raise DecodingError(str(exc)) from exc
+-
+-    def flush(self) -> bytes:
+-        try:
+-            return self.decompressor.flush()
++                self.decompressor = ZlibDecompressor(zlib.decompressobj(-zlib.MAX_WBITS))
++                yield from self.decode(data)
++            else:
++                raise DecodingError(str(exc)) from exc
++
++    def flush(self) -> typing.Iterator[bytes]:
++        try:
++            yield self.decompressor.flush()
+@@ -93,5 +141,5 @@
+-        self.decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+-
+-    def decode(self, data: bytes) -> bytes:
+-        try:
+-            return self.decompressor.decompress(data)
++        self.decompressor = ZlibDecompressor(zlib.decompressobj(zlib.MAX_WBITS | 16))
++
++    def decode(self, data: bytes) -> typing.Iterator[bytes]:
++        try:
++            yield from self.decompressor.decompress(data)
+@@ -101,3 +149,3 @@
+-    def flush(self) -> bytes:
+-        try:
+-            return self.decompressor.flush()
++    def flush(self) -> typing.Iterator[bytes]:
++        try:
++            yield self.decompressor.flush()
+@@ -128 +176 @@
+-        self._decompress: typing.Callable[[bytes], bytes]
++        self._decompress: typing.Callable[..., bytes]
+@@ -134,3 +182,3 @@
+-            self._decompress = self.decompressor.process  # pragma: no cover
+-
+-    def decode(self, data: bytes) -> bytes:
++            self._decompress = self.decompressor.process
++
++    def decode(self, data: bytes) -> typing.Iterator[bytes]:
+@@ -138 +186 @@
+-            return b""
++            return
+@@ -141 +189,6 @@
+-            return self._decompress(data)
++            # The C backend may allocate nearly twice the requested threshold.
++            output_buffer_limit = MAX_DECODE_CHUNK_SIZE // 2
++            decompressed = self._decompress(data, output_buffer_limit=output_buffer_limit)
++            while decompressed:
++                yield decompressed
++                decompressed = self._decompress(b"", output_buffer_limit=output_buffer_limit)
+@@ -145 +198 @@
+-    def flush(self) -> bytes:
++    def flush(self) -> typing.Iterator[bytes]:
+@@ -147 +200 @@
+-            return b""
++            return
+@@ -156 +208,0 @@
+-            return b""
+@@ -158,0 +211 @@
++        yield from ()
+@@ -162,5 +215,3 @@
+-    """
+-    Handle 'zstd' RFC 8878 decoding.
+-
+-    Requires `pip install zstandard`.
+-    Can be installed as a dependency of httpx using `pip install httpx[zstd]`.
++    """Handle 'zstd' RFC 8878 decoding.
++
++    On Python 3.13 and below, this requires `pip install httpx[zstd]`.
+@@ -171 +222 @@
+-        if zstandard is None:  # pragma: no cover
++        if not _zstandard_installed:  # pragma: no cover
+@@ -173,2 +224 @@
+-                "Using 'ZStandardDecoder', ..."
+-                "Make sure to install httpx using `pip install httpx[zstd]`."
++                "Using 'ZStandardDecoder', ...Make sure to install httpx using `pip install httpx[zstd]`."
+@@ -177 +227 @@
+-        self.decompressor = zstandard.ZstdDecompressor().decompressobj()
++        self.decompressor = ZstdDecompressor()
+@@ -180,2 +230,3 @@
+-    def decode(self, data: bytes) -> bytes:
+-        assert zstandard is not None
++    def decode(self, data: bytes) -> typing.Iterator[bytes]:
++        if not data:
++            return
+@@ -183,12 +234,19 @@
+-        output = io.BytesIO()
+-        try:
+-            output.write(self.decompressor.decompress(data))
+-            while self.decompressor.eof and self.decompressor.unused_data:
+-                unused_data = self.decompressor.unused_data
+-                self.decompressor = zstandard.ZstdDecompressor().decompressobj()
+-                output.write(self.decompressor.decompress(unused_data))
+-        except zstandard.ZstdError as exc:
+-            raise DecodingError(str(exc)) from exc
+-        return output.getvalue()
+-
+-    def flush(self) -> bytes:
++        try:
++            if self.decompressor.eof:
++                data = self.decompressor.unused_data + data
++                self.decompressor = ZstdDecompressor()
++            while True:
++                decompressed = self.decompressor.decompress(data, MAX_DECODE_CHUNK_SIZE)
++                while decompressed:
++                    yield decompressed
++                    if self.decompressor.needs_input or self.decompressor.eof:
++                        break
++                    decompressed = self.decompressor.decompress(b"", MAX_DECODE_CHUNK_SIZE)
++                if not (self.decompressor.eof and self.decompressor.unused_data):
++                    break
++                data = self.decompressor.unused_data
++                self.decompressor = ZstdDecompressor()
++        except ZstdError as exc:
++            raise DecodingError(str(exc)) from exc
++
++    def flush(self) -> typing.Iterator[bytes]:
+@@ -196,2 +254 @@
+-            return b""
+-        ret = self.decompressor.flush()  # note: this is a no-op
++            return
+@@ -200 +257 @@
+-        return bytes(ret)
++        yield from ()
+@@ -209,5 +266,3 @@
+-        """
+-        'children' should be a sequence of decoders in the order in which
+-        each was applied.
+-        """
+-        # Note that we reverse the order for decoding.
++        children = [child for child in children if not isinstance(child, IdentityDecoder)]
++        if len(children) > 5:
++            raise DecodingError("Cannot apply more than 5 content encodings.")
+@@ -216 +271,2 @@
+-    def decode(self, data: bytes) -> bytes:
++    def decode(self, data: bytes) -> typing.Iterator[bytes]:
++        streams: typing.Iterator[bytes] = iter((data,))
+@@ -218,5 +274,5 @@
+-            data = child.decode(data)
+-        return data
+-
+-    def flush(self) -> bytes:
+-        data = b""
++            streams = self._pipe(child.decode, streams)
++        yield from streams
++
++    def flush(self) -> typing.Iterator[bytes]:
++        streams: typing.Iterator[bytes] = iter(())
+@@ -224,2 +280,10 @@
+-            data = child.decode(data) + child.flush()
+-        return data
++            streams = itertools.chain(self._pipe(child.decode, streams), child.flush())
++        yield from streams
++
++    @staticmethod
++    def _pipe(
++        decode: typing.Callable[[bytes], typing.Iterator[bytes]],
++        upstream: typing.Iterator[bytes],
++    ) -> typing.Iterator[bytes]:
++        for chunk in upstream:
++            yield from decode(chunk)
+@@ -392 +456 @@
+-if zstandard is None:
++if not _zstandard_installed:
+--- a/httpx/_models.py
++++ b/httpx/_models.py
+@@ -898 +898,4 @@
+-                    decoded = decoder.decode(raw_bytes)
++                    for decoded in decoder.decode(raw_bytes):
++                        for chunk in chunker.decode(decoded):
++                            yield chunk
++                for decoded in decoder.flush():
+@@ -900,4 +903 @@
+-                        yield chunk
+-                decoded = decoder.flush()
+-                for chunk in chunker.decode(decoded):
+-                    yield chunk  # pragma: no cover
++                        yield chunk  # pragma: no cover
+@@ -998 +998,4 @@
+-                    decoded = decoder.decode(raw_bytes)
++                    for decoded in decoder.decode(raw_bytes):
++                        for chunk in chunker.decode(decoded):
++                            yield chunk
++                for decoded in decoder.flush():
+@@ -1000,4 +1003 @@
+-                        yield chunk
+-                decoded = decoder.flush()
+-                for chunk in chunker.decode(decoded):
+-                    yield chunk  # pragma: no cover
++                        yield chunk  # pragma: no cover
+--- a/httpx/_multipart.py
++++ b/httpx/_multipart.py
+@@ -22,0 +23,3 @@
++
++_HEADER_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
++_FORBIDDEN_HEADER_VALUE_CHARS_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+@@ -195,0 +199,4 @@
++                if _HEADER_NAME_RE.fullmatch(header_name) is None:
++                    raise ValueError("Invalid multipart header name.")
++                if _FORBIDDEN_HEADER_VALUE_CHARS_RE.search(header_value) is not None:
++                    raise ValueError("Invalid control character in multipart header value.")
+--- /dev/null
++++ b/httpx/LICENSE-HTTPX2.txt
+@@ -0,0 +1,13 @@
++Copyright © 2026 to present Pydantic Services Inc. and individual contributors.
++Copyright © 2019, [Encode OSS Ltd](https://www.encode.io/).
++All rights reserved.
++
++Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
++
++* Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
++
++* Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
++
++* Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+--- /dev/null
++++ b/httpx/PATCHES.txt
+@@ -0,0 +1,5 @@
++Local build 0.28.1+cvebackport.1, based on HTTPX 0.28.1.
++Incremental decoding is adapted from HTTPX2 v2.12.0, commit 4fd0c70a3f207c618b145934792f791bccfb39f8.
++Multipart header validation is adapted from HTTPX2 v2.11.0, commit 2b13fa92e4181d5e0f56772205360b2aa12f109d.
++HTTPX2 copyright and BSD-3-Clause license: LICENSE-HTTPX2.txt.
++This is a downstream backport and not an upstream HTTPX release.
+HTTPX_PATCH
+cat > /tmp/httpx-build-requirements.txt <<'REQ'
+hatchling==1.27.0 --hash=sha256:d3a2f3567c4f926ea39849cdf924c7e99e6686c9c8e288ae1037c8fa2a5d937b
+hatch-fancy-pypi-readme==25.1.0 --hash=sha256:ce0134c40d63d874ac48f48ccc678b8f3b62b8e50e9318520d2bffc752eedaf3
+packaging==26.3 --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+pathspec==1.1.1 --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
+pluggy==1.7.0 --hash=sha256:7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec
+trove-classifiers==2026.9.21.13 --hash=sha256:8b1ff4f9c191b1040b71c37f1e445ab99732911e3cd91de52838453a854d7a17
+REQ
+/run/uv --no-config venv --python /usr/bin/python3.13 /tmp/httpx-build-env
+/run/uv --no-config --no-cache pip install --index-url https://pypi.org/simple --python /tmp/httpx-build-env/bin/python --only-binary :all: --no-deps --require-hashes -r /tmp/httpx-build-requirements.txt
+/run/uv --no-config --no-cache build --wheel --no-sources --no-build-isolation --python /tmp/httpx-build-env/bin/python --out-dir /wheels .
+/tmp/httpx-build-env/bin/python - <<'VERIFY_HTTPX'
+import base64, csv, hashlib, io, zipfile
+from pathlib import Path
+wheel = Path('/wheels/httpx-0.28.1+cvebackport.1-py3-none-any.whl')
+with zipfile.ZipFile(wheel) as archive:
+    assert 'httpx/PATCHES.txt' in archive.namelist()
+    assert 'httpx/LICENSE-HTTPX2.txt' in archive.namelist()
+    metadata = archive.read('httpx-0.28.1+cvebackport.1.dist-info/METADATA')
+    assert b'Version: 0.28.1+cvebackport.1\n' in metadata
+    record = archive.read('httpx-0.28.1+cvebackport.1.dist-info/RECORD').decode()
+    for name, digest, size in csv.reader(io.StringIO(record)):
+        if not digest:
+            continue
+        data = archive.read(name)
+        expected = 'sha256=' + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip('=')
+        assert digest == expected and int(size) == len(data), name
+print('Verified HTTPX downstream version, notices and wheel RECORD')
+VERIFY_HTTPX
+rm -rf /tmp/httpx-source /tmp/httpx-build-env /tmp/httpx-build-requirements.txt
+SCRIPT
+
 FROM upstream AS patched
 
 ARG TARGETARCH
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="1.106.6-oss-r3" \
+      org.opencontainers.image.version="1.106.6-oss-r4" \
       org.opencontainers.image.description="Custom dependency remediation of LiteLLM 1.106.6 for linux/amd64; requires a fresh vulnerability scan before use"
 
 # uv exists only during this RUN; it is not installed in the resulting image.
 # Keep the upstream USER, PATH, ENTRYPOINT, CMD and application payload intact.
 RUN --mount=from=uv,source=/uv,target=/run/uv \
     --mount=from=xml-builder,source=/wheels,target=/run/xml-wheels \
+    --mount=from=httpx-wheel-builder,source=/wheels,target=/run/httpx-wheels \
     --mount=type=secret,id=build_ca,target=/etc/ssl/certs/ca-certificates.crt <<'SH'
 set -eu
 test "$TARGETARCH" = amd64
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 /app/.venv/bin/python - <<'PY'
-import hashlib, importlib.metadata as m, json
+import hashlib, importlib.metadata as m, json, sys
 from pathlib import Path
+Path("/usr/share/build-info").mkdir(parents=True, exist_ok=True)
+Path("/usr/share/build-info/upstream-python.json").write_text(json.dumps({"version": list(sys.version_info[:3]), "binary_sha256": hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest()}))
 assert m.version("litellm") == "1.106.6"
 root = Path(m.distribution("litellm").locate_file("litellm"))
 hashes = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -325,8 +721,8 @@ apk add --no-cache --repositories-file /dev/null \
     --repository https://packages.wolfi.dev/os \
     libexpat1=2.10.0-r0 \
     py3-pip-wheel=26.2.2-r2 \
-    python-3.13=3.13.18_git20261030-r0 \
-    python-3.13-base=3.13.18_git20261030-r0 \
+    python-3.13=3.13.17_git20261023-r1 \
+    python-3.13-base=3.13.17_git20261023-r1 \
     libxml2-16=2.15.4-r2 libxslt=1.1.45-r5 xmlsec=1.3.13-r0 \
     xmlsec-openssl=1.3.13-r0
 
@@ -348,6 +744,15 @@ PyJWT==2.15.0 --hash=sha256:7a3742debf6b879e912dbb9819ceec1594be812452b78c5f2e2d
 opentelemetry-api==1.45.1 --hash=sha256:b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb
 REQ
 
+/app/.venv/bin/python - <<'VERIFY_PYTHON'
+import hashlib, json, sys
+from pathlib import Path
+original = json.loads(Path('/usr/share/build-info/upstream-python.json').read_text())
+assert list(sys.version_info[:3]) == original['version'] == [3, 13, 17]
+assert hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest() == original['binary_sha256']
+print('Runtime Python version and executable are unchanged from the pinned upstream image')
+VERIFY_PYTHON
+
 # No dependency re-resolution: every added/replaced wheel is explicitly pinned.
 # The final checks below reject incompatible installed dependency combinations.
 /run/uv --no-config --no-cache pip install --python /app/.venv/bin/python \
@@ -358,6 +763,8 @@ REQ
     --require-hashes -r /tmp/patch-admin.txt
 /run/uv --no-config --no-cache pip install --python /app/.venv/bin/python \
     --no-deps --no-index --reinstall /run/xml-wheels/lxml-*.whl /run/xml-wheels/xmlsec-*.whl
+/run/uv --no-config --no-cache pip install --python /app/.venv/bin/python \
+    --no-deps --no-index --reinstall /run/httpx-wheels/httpx-0.28.1+cvebackport.1-py3-none-any.whl
 
 # Explicit backport of upstream PR #49137's filelock dependency bound.
 # This changes only the declared supported range, with the fixed library really
@@ -401,7 +808,7 @@ PY
 # https://github.com/python/cpython/commit/9f52b443c002cccfb54bda0706a9276b6b4a109d
 /app/.venv/bin/python -B - <<'PY'
 #!/usr/bin/env python3
-"""Apply three official CPython fixes to one exact Wolfi Python 3.13.18 build.
+"""Apply three official CPython fixes to the exact upstream Wolfi Python 3.13.17 build.
 
 Upstream patches (PSF-licensed source remains otherwise unchanged):
   CVE-2025-15367: b234a2b67539f787e191d2ef19a7cbdce32874e7
@@ -636,7 +1043,7 @@ ENV PATH="/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin
     PRISMA_CLI_QUERY_ENGINE_TYPE="binary" \
     PRISMA_OFFLINE_MODE="true"
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="1.106.6-oss-r3" \
+      org.opencontainers.image.version="1.106.6-oss-r4" \
       org.opencontainers.image.base.name="ghcr.io/berriai/litellm:v1.106.6" \
       org.opencontainers.image.base.digest="sha256:37e2dafb088a7723beb998590682957386dfc83ffea1848486f8e0e5cfac0b06" \
       org.opencontainers.image.description="Experimental LiteLLM 1.106.6 OSS rebuild with security patches; redistribution review and destination scan required"

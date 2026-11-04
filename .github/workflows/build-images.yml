@@ -205,34 +205,116 @@ jobs:
           print(f'PASS {len(declared)} image layers / {entries} entries contain no restricted Enterprise paths')
           PYCODE
           docker save "$LOCAL_IMAGE" | python3 "$RUNNER_TEMP/check-image-layers.py"
-      - &scanner
-        name: Install checksum-pinned Trivy 0.76.1
+      - &httpx_security
+        name: Verify HTTPX security backport
+        if: matrix.oss == 'litellm'
         shell: bash
         run: |
           set -euo pipefail
-          # SHA256 agrees with both the official release checksums file and
-          # the GitHub release asset API digest for v0.76.1 (Linux-64bit).
-          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --retry 3 --output "$RUNNER_TEMP/trivy.tar.gz" \
-            https://github.com/aquasecurity/trivy/releases/download/v0.76.1/trivy_0.76.1_Linux-64bit.tar.gz
-          printf '%s  %s\n' c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0 \
-            "$RUNNER_TEMP/trivy.tar.gz" | sha256sum --check --strict
-          mkdir -p "$RUNNER_TEMP/trivy-bin"
-          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/trivy-bin" trivy
-          "$RUNNER_TEMP/trivy-bin/trivy" --version
-      - &scan
-        name: Block on any vulnerability or scan error
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Fresh per-job DB; no ignored CVEs, omitted severities or hidden package types.
-          "$RUNNER_TEMP/trivy-bin/trivy" image \
-            --config /dev/null --cache-dir "$RUNNER_TEMP/trivy-cache" \
-            --scanners vuln --pkg-types os,library \
-            --ignorefile '' --ignore-unfixed=false \
-            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
-            --skip-db-update=false --skip-java-db-update=false --timeout 30m \
-            "$LOCAL_IMAGE"
+          docker run --rm -i --network none --entrypoint /app/.venv/bin/python "$LOCAL_IMAGE" - <<'PYCODE'
+          import asyncio
+          import gzip
+          import importlib.metadata as metadata
+          import sys
+          import json
+          import hashlib
+          from pathlib import Path
+          import zlib
+          import httpx
+          from packaging.version import Version
+
+          original = json.loads(Path('/usr/share/build-info/upstream-python.json').read_text())
+          assert list(sys.version_info[:3]) == original['version']
+          assert hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest() == original['binary_sha256']
+          print('Python:', sys.version)
+          print('httpx:', metadata.version('httpx'), 'httpx2:', metadata.version('httpx2'))
+          assert sys.version_info[:3] == (3, 13, 17)
+          assert Version(metadata.version('httpx')) == Version('0.28.1+cvebackport.1')
+          assert Version(metadata.version('httpx2')) >= Version('2.12.0')
+
+          # Whole compressed data arrives in one transport chunk. Without bounded
+          # decompression this expands to over 4 MiB in a single output chunk.
+          plain = b'abcde' * (800 * 1024) + b'!'
+          assert len(plain) < 5 * 1024 * 1024
+          cases = {
+              'gzip': gzip.compress(plain),
+              'deflate': zlib.compress(plain),
+              'gzip, deflate': zlib.compress(gzip.compress(plain)),
+          }
+          def handler(request):
+              encoding = request.url.path.lstrip('/')
+              return httpx.Response(200, headers={'Content-Encoding': encoding},
+                                    stream=httpx.ByteStream(cases[encoding]))
+          def check(chunks):
+              assert chunks and max(map(len, chunks)) <= 1024 * 1024
+              assert b''.join(chunks) == plain
+          with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+              for encoding in cases:
+                  with client.stream('GET', f'http://local/{encoding}') as response:
+                      check(list(response.iter_bytes()))
+
+          async def check_async():
+              async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                  for encoding in cases:
+                      async with client.stream('GET', f'http://local/{encoding}') as response:
+                          check([chunk async for chunk in response.aiter_bytes()])
+          asyncio.run(check_async())
+
+          # Use the public request API to exercise serialization rather than the
+          # internal validator. CRLF in content-type/header values and invalid
+          # header names must fail; ordinary multipart metadata must still work.
+          for part in [
+              ('x.txt', b'data', 'text/plain\r\nX-Injected: yes'),
+              ('x.txt', b'data', 'text/plain', {'X-Valid': 'ok\r\nX-Injected: yes'}),
+              ('x.txt', b'data', 'text/plain', {'Bad Name': 'value'}),
+          ]:
+              try:
+                  httpx.Request('POST', 'http://local/', files={'file': part}).read()
+              except ValueError:
+                  pass
+              else:
+                  raise AssertionError(f'invalid multipart metadata accepted: {part!r}')
+          valid = httpx.Request('POST', 'http://local/', files={
+              'file': ('x.txt', b'valid payload', 'text/plain', {'X-Valid': 'yes'})
+          }).read()
+          assert b'valid payload' in valid and b'X-Valid: yes' in valid
+          # SDKs retain their normal HTTPX client types. All responses are local
+          # synthetic fixtures; no provider credentials or network are used.
+          import openai
+          import anthropic
+          model_list = {'data': [], 'object': 'list'}
+          message = {'id': 'msg_mock', 'type': 'message', 'role': 'assistant',
+                     'model': 'mock', 'content': [{'type': 'text', 'text': 'ok'}],
+                     'stop_reason': 'end_turn', 'stop_sequence': None,
+                     'usage': {'input_tokens': 1, 'output_tokens': 1}}
+          def sdk_handler(request):
+              return httpx.Response(200, json=message if request.url.path.endswith('/messages') else model_list)
+          with openai.OpenAI(api_key='local-test-only', http_client=httpx.Client(
+                  transport=httpx.MockTransport(sdk_handler))) as client:
+              assert client.models.list().data == []
+          with anthropic.Anthropic(api_key='local-test-only', http_client=httpx.Client(
+                  transport=httpx.MockTransport(sdk_handler))) as client:
+              assert client.messages.create(model='mock', max_tokens=1,
+                  messages=[{'role': 'user', 'content': 'test'}]).content[0].text == 'ok'
+          async def sdk_async():
+              async with openai.AsyncOpenAI(api_key='local-test-only', http_client=httpx.AsyncClient(
+                      transport=httpx.MockTransport(sdk_handler))) as client:
+                  assert (await client.models.list()).data == []
+              async with anthropic.AsyncAnthropic(api_key='local-test-only', http_client=httpx.AsyncClient(
+                      transport=httpx.MockTransport(sdk_handler))) as client:
+                  assert (await client.messages.create(model='mock', max_tokens=1,
+                      messages=[{'role': 'user', 'content': 'test'}])).content[0].text == 'ok'
+          asyncio.run(sdk_async())
+          print('PASS HTTPX security regressions and OpenAI/Anthropic sync/async SDKs')
+          PYCODE
+          docker run --rm -i --network none --entrypoint /opt/liteadmin/bin/python "$LOCAL_IMAGE" - <<'PYCODE'
+          import importlib.metadata as metadata
+          import sys
+          print('Admin Python:', sys.version)
+          print('Admin httpx2:', metadata.version('httpx2'))
+          assert sys.version_info[:3] == (3, 13, 17)
+          assert metadata.version('httpx2') == '2.13.0'  # fixed, no packaging dependency
+          PYCODE
       - &runtime
         name: Verify LiteLLM API, authentication, streaming, UI and persistent database
         if: matrix.oss == 'litellm'
@@ -359,6 +441,34 @@ jobs:
         run: |
           docker rm -f ci-proxy ci-postgres >/dev/null 2>&1 || true
           docker network rm ci-smoke >/dev/null 2>&1 || true
+      - &scanner
+        name: Install checksum-pinned Trivy 0.76.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          # SHA256 agrees with both the official release checksums file and
+          # the GitHub release asset API digest for v0.76.1 (Linux-64bit).
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 3 --output "$RUNNER_TEMP/trivy.tar.gz" \
+            https://github.com/aquasecurity/trivy/releases/download/v0.76.1/trivy_0.76.1_Linux-64bit.tar.gz
+          printf '%s  %s\n' c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0 \
+            "$RUNNER_TEMP/trivy.tar.gz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/trivy-bin" trivy
+          "$RUNNER_TEMP/trivy-bin/trivy" --version
+      - &scan
+        name: Block on any vulnerability or scan error
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fresh per-job DB; no ignored CVEs, omitted severities or hidden package types.
+          "$RUNNER_TEMP/trivy-bin/trivy" image \
+            --config /dev/null --cache-dir "$RUNNER_TEMP/trivy-cache" \
+            --scanners vuln --pkg-types os,library \
+            --ignorefile '' --ignore-unfixed=false \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
+            --skip-db-update=false --skip-java-db-update=false --timeout 30m \
+            "$LOCAL_IMAGE"
       - &identity
         name: Confirm the validated image was not replaced
         shell: bash
@@ -420,10 +530,11 @@ jobs:
       - *build
       - *exclusion
       - *layers
-      - *scanner
-      - *scan
+      - *httpx_security
       - *runtime
       - *cleanup
+      - *scanner
+      - *scan
       - *identity
       - name: Install Podman if the hosted runner does not provide it
         shell: bash
