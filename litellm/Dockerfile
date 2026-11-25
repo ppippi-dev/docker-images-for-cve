@@ -27,6 +27,10 @@
 #   A score omitted by Trivy is accepted only if its complete valid v3 vector
 #   proves zero base impact; missing assessments are never treated as zero.
 # - Preserve upstream license notices; an image contains multiple licenses.
+# - Main publishes each image.version once as v<image.version>; a published
+#   version tag is never re-pointed. Raise the rN suffix of image.version
+#   (1.108.0-oss-r1 -> -r2) to publish a rebuild of the same LiteLLM version;
+#   the upstream tag (v1.108.0) then points to the -r2 image.
 #
 # Build (linux/amd64 only; no local build context is sent):
 #   docker build --platform linux/amd64 -t litellm-cve:1.108.0-oss-r1 - < litellm/Dockerfile

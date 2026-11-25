@@ -1,7 +1,15 @@
 # Add each OSS as <name>/Dockerfile with an org.opencontainers.image.version label.
 # Build contexts stay empty; no local configuration or internal reports are inputs.
-# Publish validated OSS images to public packages, as selected by the owner.
-# Package visibility is independent of repository visibility.
+# Pushes to main that change a recipe or this workflow, and manual runs on main,
+# build, test and scan every selected recipe, then publish it to a public package
+# as v<version label> and sha-<commit> (LiteLLM also as its upstream tag).
+# A published v<version label> tag is never re-pointed: if it already exists, the
+# recipe is still verified but nothing is pushed. It is pushed last, so it exists
+# only after every other tag was pushed. Raise the rN suffix of the version label
+# to publish a rebuild; the LiteLLM upstream tag follows the newest rN.
+# Package visibility is independent of repository visibility. A new package starts
+# private; set it Public, then check the pushed digest with Verify published image
+# with Podman.
 name: Build, verify and publish OSS images
 
 on:
@@ -112,6 +120,26 @@ jobs:
       LOCAL_IMAGE: ci-local/${{ matrix.oss }}:${{ github.sha }}
     steps:
       - *checkout
+      - &disk
+        name: Free runner disk for the large vLLM image
+        if: matrix.oss == 'vllm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          # The ~10 GB (uncompressed) image needs about 25 GB while it is built and
+          # exported, plus scanner and Podman copies. Hosted runners guarantee 14 GB;
+          # remove preinstalled SDKs that these jobs never use.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /opt/microsoft /opt/google /usr/local/julia*
+          docker image prune --all --force >/dev/null
+          df -h /
+          available_gb="$(df --output=avail -BG / | tail -1 | tr -dc 0-9)"
+          if [ "$available_gb" -lt 35 ]; then
+            echo "::error::Only ${available_gb} GB free on /; the vLLM build needs at least 35 GB"
+            exit 1
+          fi
       - &build
         name: Build linux/amd64 with an empty context
         shell: bash
@@ -130,6 +158,83 @@ jobs:
           image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
           [[ "$image_version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]
           docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE" > "$RUNNER_TEMP/validated-image-id"
+      - &release_build_cache
+        name: Release the vLLM build cache on this disposable runner
+        if: matrix.oss == 'vllm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The tagged image is kept; only intermediate build snapshots are removed.
+          docker builder prune --all --force >/dev/null
+          df -h /
+      - &vllm_runtime
+        name: Verify vLLM imports, CUDA wheels, CLI and non-root read-only start (no GPU)
+        if: matrix.oss == 'vllm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Config.User}}' "$LOCAL_IMAGE")" = 2000:0
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$LOCAL_IMAGE")" = '["vllm","serve"]'
+          test "$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$LOCAL_IMAGE")" = '{"8000/tcp":{}}'
+          # No GPU on hosted runners: offline, non-root, read-only root filesystem with
+          # writable tmpfs for /tmp and the cache home, as a hardened deployment would use.
+          run=(docker run --rm -i --network none --read-only --cap-drop ALL --security-opt no-new-privileges
+               --tmpfs /tmp:rw,exec,mode=1777 --tmpfs /home/vllm:rw,exec,uid=2000,gid=0,mode=0770)
+          "${run[@]}" --entrypoint /opt/vllm/bin/python "$LOCAL_IMAGE" -I - <<'PYCODE'
+          import ctypes, glob, importlib.metadata as metadata, importlib.util, os, pwd, shutil, subprocess, sysconfig
+          from pathlib import Path
+          assert (os.getuid(), os.getgid()) == (2000, 0) and pwd.getpwuid(2000).pw_name == 'vllm'
+          assert os.environ['HOME'] == '/home/vllm'
+          for path in ('/opt/vllm/probe', '/etc/probe'):
+              try:
+                  Path(path).write_text('x')
+              except OSError:
+                  pass
+              else:
+                  raise AssertionError('root filesystem is writable: ' + path)
+          cache = Path.home() / '.cache/probe'
+          cache.parent.mkdir(parents=True, exist_ok=True)
+          cache.write_text('ok')
+          assert metadata.version('vllm') == '0.34.0'
+          import torch, triton, vllm
+          from vllm.entrypoints.openai import api_server
+          from vllm.entrypoints.cli import main
+          assert vllm.__version__ == '0.34.0' and torch.version.cuda.startswith('13.')
+          print('torch', torch.__version__, 'CUDA', torch.version.cuda, 'triton', triton.__version__)
+          site = Path(sysconfig.get_paths()['purelib'])
+          for name in ('libcudart.so.13', 'libcublas.so.13', 'libcublasLt.so.13', 'libcudnn.so.9', 'libnccl.so.2',
+                       'libnvrtc.so.13', 'libnvJitLink.so.13', 'libcusparseLt.so.0', 'libcufft.so.12',
+                       'libcurand.so.10', 'libcusolver.so.12', 'libcusparse.so.12', 'libnvshmem_host.so.3'):
+              found = sorted(site.glob('nvidia/**/' + name))
+              assert found, 'missing CUDA wheel library ' + name
+          # The user-space runtime loads without a driver; libcuda comes from the host.
+          ctypes.CDLL(str(sorted(site.glob('nvidia/**/libcudart.so.13'))[0]))
+          assert not glob.glob('/usr/lib64/libcuda.so*') and not Path('/usr/local/cuda').exists()
+          assert importlib.util.find_spec('pip') is None
+          assert not any(shutil.which(tool) for tool in ('pip', 'pip3', 'pip3.12', 'uv', 'uvx', 'ffmpeg', 'apt-get'))
+          # Triton compiles its CUDA launcher with the system C compiler at first use.
+          driver = Path(triton.__file__).parent / 'backends/nvidia'
+          subprocess.run(['gcc', '-O3', '-fPIC', '-c', str(driver / 'driver.c'), '-I', str(driver / 'include'),
+                          '-I', sysconfig.get_paths()['include'], '-o', '/tmp/triton-driver.o'], check=True)
+          assert Path('/tmp/triton-driver.o').stat().st_size > 0
+          assert (site / 'vllm-0.34.0.dist-info/licenses/LICENSE').is_file()
+          print('PASS vLLM/torch imports, CUDA wheel libraries, no pip/uv, Triton C launcher build, non-root read-only')
+          PYCODE
+          # Without a GPU, vLLM cannot infer the CUDA device while building its parser;
+          # select the CPU platform only to exercise the real entrypoint and CLI flags.
+          help_log="$RUNNER_TEMP/vllm-serve-help.log"
+          if ! "${run[@]}" -e VLLM_TARGET_DEVICE=cpu "$LOCAL_IMAGE" --help=all > "$help_log" 2>&1; then
+            cat "$help_log"
+            exit 1
+          fi
+          for pattern in '^usage: vllm serve' '--port' '--served-model-name'; do
+            if ! grep -q -e "$pattern" "$help_log"; then
+              cat "$help_log"
+              echo "::error::vllm serve --help=all output lacks $pattern"
+              exit 1
+            fi
+          done
+          echo 'PASS entrypoint vllm serve --help=all (no GPU, no network, read-only root)'
       - &exclusion
         name: Verify Enterprise components are absent from LiteLLM
         if: matrix.oss == 'litellm'
@@ -682,7 +787,10 @@ jobs:
           print('Verified public package visibility.')
           PYCODE
           python3 "$RUNNER_TEMP/check-package-visibility.py" before
+      - *disk
       - *build
+      - *release_build_cache
+      - *vllm_runtime
       - *exclusion
       - *layers
       - *httpx_security
@@ -691,7 +799,113 @@ jobs:
       - *scanner
       - *scan
       - *identity
+      - name: Check whether this version is already published
+        id: published
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
+          [[ "$image_version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,126}$ ]]
+          cat > "$RUNNER_TEMP/check-published-version.py" <<'PYCODE'
+          import base64, json, os, re, sys, urllib.error, urllib.parse, urllib.request
+          # Prints "published" or "absent" for ghcr.io/<owner>/<recipe>:<tag>. Only a
+          # definite "unknown" answer means absent; authentication errors, rate limits,
+          # network errors and unexpected answers exit non-zero, so nothing is pushed.
+          MEDIA_TYPES = ', '.join((
+              'application/vnd.oci.image.index.v1+json', 'application/vnd.oci.image.manifest.v1+json',
+              'application/vnd.docker.distribution.manifest.list.v2+json',
+              'application/vnd.docker.distribution.manifest.v2+json'))
+
+          def fetch(url, headers):
+              # HTTP statuses are answers; transport errors propagate and fail the job.
+              request = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return response.status, response.headers, response.read()
+              except urllib.error.HTTPError as error:
+                  return error.code, error.headers, error.read()
+
+          def package_exists(owner, name, token):
+              status, _, body = fetch(f'https://api.github.com/users/{owner}/packages/container/{name}', {
+                  'Authorization': 'Bearer ' + token,
+                  'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+              if status == 404:
+                  return False
+              if status != 200:
+                  raise SystemExit(f'Packages API answered HTTP {status} for {name}; cannot tell whether it is published')
+              package = json.loads(body)
+              assert package['name'] == name and package['package_type'] == 'container'
+              assert package['owner']['login'].lower() == owner.lower()
+              return True
+
+          def registry_digest(repository, tag, scope, credentials=None):
+              # Returns the manifest digest, or None only for MANIFEST_UNKNOWN/NAME_UNKNOWN.
+              headers = {}
+              if credentials:
+                  headers['Authorization'] = 'Basic ' + base64.b64encode(':'.join(credentials).encode()).decode()
+              query = urllib.parse.urlencode({'service': 'ghcr.io', 'scope': f'repository:{repository}:{scope}'})
+              status, _, body = fetch('https://ghcr.io/token?' + query, headers)
+              if status != 200:
+                  raise SystemExit(f'GHCR token request answered HTTP {status}: {body[:200]!r}')
+              token = json.loads(body).get('token')
+              if not isinstance(token, str) or not token:
+                  raise SystemExit('GHCR token response has no token')
+              status, answer, body = fetch(f'https://ghcr.io/v2/{repository}/manifests/{tag}', {
+                  'Authorization': 'Bearer ' + token, 'Accept': MEDIA_TYPES})
+              if status == 200:
+                  digest = answer.get('Docker-Content-Digest', '')
+                  if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+                      raise SystemExit('GHCR returned a manifest without a valid digest')
+                  return digest
+              if status == 404:
+                  try:
+                      codes = {error['code'] for error in json.loads(body)['errors']}
+                  except (ValueError, KeyError, TypeError):
+                      codes = set()
+                  if codes and codes <= {'MANIFEST_UNKNOWN', 'NAME_UNKNOWN'}:
+                      return None
+              raise SystemExit(f'GHCR manifest request answered HTTP {status}: {body[:200]!r}')
+
+          def main():
+              owner, name, tag = os.environ['REGISTRY_OWNER'], os.environ['OSS'], sys.argv[1]
+              token, user = os.environ['GHCR_TOKEN'], os.environ['GHCR_USER']
+              assert token and user and re.fullmatch(r'v[a-zA-Z0-9_.-]{1,127}', tag)
+              exists = package_exists(owner, name, token)
+              # Anonymous reads cannot tell a private package from a missing one. The job
+              # token with the pull,push scope that docker push requests can read every
+              # package this job can push to; a new package answers MANIFEST_UNKNOWN.
+              digest = registry_digest(f'{owner.lower()}/{name}', tag, 'pull,push', (user, token))
+              if digest and not exists:
+                  raise SystemExit('Packages API reports no package, but GHCR has the tag; refusing to decide')
+              if digest:
+                  print(f'{name}:{tag} is already published as {digest}', file=sys.stderr)
+                  print('published')
+              else:
+                  print(f'{name}:{tag} is not published' + ('' if exists else ' (new package)'), file=sys.stderr)
+                  print('absent')
+
+          if __name__ == '__main__':
+              main()
+          PYCODE
+          state="$(python3 "$RUNNER_TEMP/check-published-version.py" "v$image_version")"
+          [[ "$state" == published || "$state" == absent ]]
+          printf 'state=%s\ntag=v%s\n' "$state" "$image_version" >> "$GITHUB_OUTPUT"
+      - name: Record that this version is already published
+        if: steps.published.outputs.state == 'published'
+        env:
+          FIXED_TAG: ${{ steps.published.outputs.tag }}
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Built, tested and scanned `%s`. `ghcr.io/%s/%s:%s` is already published and is never re-pointed, so nothing was pushed. To publish a rebuild, raise the rN suffix of org.opencontainers.image.version in `%s/Dockerfile`. A first publication that stopped at private visibility is checked with Verify published image with Podman.\n' \
+            "$OSS" "${REGISTRY_OWNER,,}" "$OSS" "$FIXED_TAG" "$OSS" >> "$GITHUB_STEP_SUMMARY"
       - name: Install Podman if the hosted runner does not provide it
+        if: steps.published.outputs.state == 'absent'
         shell: bash
         run: |
           set -euo pipefail
@@ -701,7 +915,9 @@ jobs:
           fi
           podman --version
       - name: Publish version tags and verify anonymous Podman pull
+        if: steps.published.outputs.state == 'absent'
         env:
+          FIXED_TAG: ${{ steps.published.outputs.tag }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GHCR_USER: ${{ github.actor }}
           REGISTRY_OWNER: ${{ github.repository_owner }}
@@ -732,6 +948,9 @@ jobs:
             [[ "$fixed_tag" == "$alias_tag-oss-"* ]]
           fi
           python3 "$RUNNER_TEMP/check-package-visibility.py" before
+          # Never re-point a published version tag; recheck right before pushing.
+          test "$fixed_tag" = "$FIXED_TAG"
+          test "$(python3 "$RUNNER_TEMP/check-published-version.py" "$fixed_tag")" = absent
           image_id="$(cat "$RUNNER_TEMP/validated-image-id")"
           test "$(docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE")" = "$image_id"
           export DOCKER_CONFIG="$RUNNER_TEMP/ghcr-auth"
@@ -740,12 +959,22 @@ jobs:
           chmod 700 "$DOCKER_CONFIG"
           trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"; rm -f "$podman_auth"' EXIT
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
-          for tag in "$fixed_tag" "sha-$GITHUB_SHA" "$alias_tag"; do
+          # The version tag goes last: if a push stops early, the version still reads
+          # as absent and a re-run pushes the whole set again.
+          tags=("sha-$GITHUB_SHA")
+          [ "$alias_tag" = "$fixed_tag" ] || tags+=("$alias_tag")
+          tags+=("$fixed_tag")
+          for tag in "${tags[@]}"; do
             docker tag "$image_id" "$registry_image:$tag"
             docker push "$registry_image:$tag"
           done
-          python3 "$RUNNER_TEMP/check-package-visibility.py" after
           expected_digest="$(docker image inspect "$registry_image:$alias_tag" | python3 -c 'import json,sys; repo=sys.argv[1]; matches=[s.split("@",1)[1] for s in json.load(sys.stdin)[0]["RepoDigests"] if s.startswith(repo+"@")]; assert len(set(matches))==1; print(matches[0])' "$registry_image")"
+          # Recorded before the visibility check: a new private package needs this
+          # tag, digest and image ID for Verify published image with Podman after it is
+          # set Public.
+          printf 'Pushed `%s`: %s\n\nDigest: `%s`\n\nImage ID: `%s`\n\n' \
+            "$registry_image" "${tags[*]}" "$expected_digest" "$image_id" >> "$GITHUB_STEP_SUMMARY"
+          python3 "$RUNNER_TEMP/check-package-visibility.py" after
           # Podman has independent storage, so this checks a real registry pull.
           # A fresh, empty authfile proves consumers can pull without a login.
           umask 077

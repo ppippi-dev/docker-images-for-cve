@@ -35,7 +35,8 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # A vLLM pull is ~4.5 GB compressed and ~10 GB unpacked.
+    timeout-minutes: ${{ inputs.image == 'vllm' && 45 || 15 }}
     env:
       PACKAGE: ${{ inputs.image }}
       IMAGE_TAG: ${{ inputs.tag }}
@@ -53,6 +54,16 @@ jobs:
           [[ "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ -z "$EXPECTED_CONFIG" || "$EXPECTED_CONFIG" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$VISIBILITY" == public || "$VISIBILITY" == private ]]
+      - name: Free runner disk for the large vLLM image
+        if: inputs.image == 'vllm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Hosted runners guarantee 14 GB; the pull needs the layers twice while unpacking.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /opt/microsoft /opt/google /usr/local/julia*
+          df -h /
       - name: Install Podman if needed
         shell: bash
         run: |
