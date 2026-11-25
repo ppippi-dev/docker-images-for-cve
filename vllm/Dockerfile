@@ -22,7 +22,7 @@
 # see each component's license text for its terms.
 #
 # PUBLIC REPOSITORY RULES
-# - Track <open-source-name>/Dockerfile and reviewed build workflows only.
+# - Track README.md, <open-source-name>/Dockerfile and reviewed build workflows only.
 #   Never commit organization data, configuration,
 #   hostnames, credentials, certificates, logs, scan reports, SBOMs or image TARs.
 # - Use public upstream artifacts only; pin images by digest and Python wheels
@@ -64,8 +64,8 @@
 #   readable by everyone, so the container also starts under another UID and
 #   GID (CI starts it as 65534:65534). Such a user cannot write /home/vllm: set
 #   HOME, or the cache variables, to a writable directory. Relative paths
-#   resolve against /vllm-workspace, which only root can write (r1 used
-#   /home/vllm): pass absolute paths.
+#   resolve against /vllm-workspace, which only root can write: pass absolute
+#   paths.
 #
 # Build (linux/amd64 only; no local build context is sent; ~30 GB free disk):
 #   docker build --platform linux/amd64 -t vllm-cve:0.34.0-oss-r2 - < vllm/Dockerfile

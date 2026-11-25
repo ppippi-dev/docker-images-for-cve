@@ -1,15 +1,40 @@
 # Add each OSS as <name>/Dockerfile with an org.opencontainers.image.version label.
-# Build contexts stay empty; no local configuration or internal reports are inputs.
-# Pushes to main that change a recipe or this workflow, and manual runs on main,
-# build, test and scan every selected recipe, then publish it to a public package
-# as v<version label> and sha-<commit> (LiteLLM also as its upstream tag).
+# Build contexts stay empty; no local files, configuration or reports are inputs.
+# Selection:
+# - Pull request: the recipes whose <name>/Dockerfile changed, or every recipe
+#   when this workflow changed. Build, test and scan only; nothing is published.
+# - Push to main: the recipes whose <name>/Dockerfile changed in that push
+#   (before..after). A first push, a force-push or unavailable history selects
+#   every recipe. A push that changes only this workflow selects nothing, so
+#   change this workflow through a pull request (it verifies every recipe) or
+#   a manual run on another branch.
+# - Manual run: one recipe folder name, or all (default). Only a run on main
+#   publishes; elsewhere it verifies without publishing.
+# An empty selection skips the build jobs and the run ends green.
+# Main builds, tests and scans each selected recipe, then publishes it as
+# sha-<commit> and v<version label>.
 # A published v<version label> tag is never re-pointed: if it already exists, the
 # recipe is still verified but nothing is pushed. It is pushed last, so it exists
 # only after every other tag was pushed. Raise the rN suffix of the version label
-# to publish a rebuild; the LiteLLM upstream tag follows the newest rN.
-# Package visibility is independent of repository visibility. A new package starts
-# private; set it Public, then check the pushed digest with Verify published image
-# with Podman.
+# to publish a rebuild. Never lower the label: a deleted label would be published
+# again with other contents.
+# Only the newest version of each image is kept. Once v<version label> is
+# published and pulls anonymously (pushed by this run, or already published and
+# checked anonymously), the main job deletes every other version of that package:
+# older v<...> tags with their sha-<commit> tags and untagged manifests. It
+# deletes nothing if v<version label> is an image index, the package listing does
+# not show exactly one version with its digest, or another version was created
+# after it. Consumers pin the digest and move to the new one, or copy the image
+# into their own registry. The package owner can restore a deleted version
+# within 30 days in the package settings.
+# A push run refuses to publish or delete once main has advanced, and GitHub may
+# replace a pending run; publish such a recipe with a manual run on main.
+# A new package linked to this public repository may be public as soon as the
+# job pushes it, so merging a recipe to main is its publication: judge the
+# license conditions of the image contents before merging. The job
+# still checks that the package is public and pulls the pushed digest
+# anonymously; if a package is not public, set it Public and check the digest
+# with Verify published image with Podman.
 name: Build, verify and publish OSS images
 
 on:
@@ -22,7 +47,7 @@ on:
     inputs:
       image:
         description: 'OSS folder name, or all'
-        required: true
+        required: false
         default: all
         type: string
 
@@ -77,9 +102,23 @@ jobs:
                   raise SystemExit('Requested image must be all or an existing OSS folder')
               selected = folders if requested == 'all' else [requested]
           elif name == 'push':
-              # GitHub concurrency can replace a pending main run. Build the
-              # complete current state so an earlier OSS change cannot be lost.
-              selected = folders
+              # Only the recipes changed by this push. A first push (zero before),
+              # a force-push or missing history cannot be compared: build all.
+              # A push that changes only this workflow selects nothing.
+              before, head = event.get('before') or '', os.environ['GITHUB_SHA']
+              changed = None
+              if (re.fullmatch(r'[0-9a-f]{40}', before) and before != '0' * 40
+                      and not event.get('forced')):
+                  if not re.fullmatch(r'[0-9a-f]{40}', head):
+                      raise SystemExit('Unexpected commit identifier')
+                  result = subprocess.run(['git', 'diff', '--name-only', '-z', before, head],
+                                          check=False, capture_output=True)
+                  if result.returncode == 0:
+                      changed = set(result.stdout.decode().rstrip('\0').split('\0'))
+              if changed is None:
+                  selected = folders
+              else:
+                  selected = [folder for folder in folders if folder + '/Dockerfile' in changed]
           else:
               base, head = event['pull_request']['base']['sha'], event['pull_request']['head']['sha']
               changed = None
@@ -98,7 +137,10 @@ jobs:
           matrix = {'oss': selected}
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('matrix=' + json.dumps(matrix) + '\ncount=' + str(len(selected)) + '\n')
-          print('Selected OSS images: ' + ', '.join(selected))
+          print('Selected OSS images: ' + (', '.join(selected) or 'none'))
+          if not selected:
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write('No recipe selected: nothing was built, checked or published.\n')
           PY
 
   verify-pr:
@@ -261,323 +303,78 @@ jobs:
             exit 1
           fi
           echo 'PASS entrypoint vllm serve --help=all as UID/GID 65534'
-      - &exclusion
-        name: Verify Enterprise components are absent from LiteLLM
-        if: matrix.oss == 'litellm'
+      - &postgres_runtime
+        name: Verify PostgreSQL as uid 70 (read-only root) and as root with password logins
+        if: matrix.oss == 'postgres'
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -i --network none -e LITELLM_LOCAL_MODEL_COST_MAP=true --entrypoint /app/.venv/bin/python "$LOCAL_IMAGE" - <<'PYCODE'
-          import importlib.metadata as metadata
-          import importlib.util
-          from pathlib import Path
-          from packaging.requirements import Requirement
-          assert metadata.version('litellm') == '1.108.0'
-          for module in ('litellm_enterprise', 'ddtrace', '_ddtrace_internal'):
-              assert importlib.util.find_spec(module) is None
-          names = {d.metadata['Name'].lower().replace('_', '-') for d in metadata.distributions()}
-          assert not names.intersection({'litellm-enterprise', 'ddtrace', 'ddtrace-internal'})
-          assert not Path('/app/.venv/bin/ddtrace-run').exists()
-          assert not Path('/app/.venv/bin/_dd_crashtracker_receiver').exists()
-          assert all(Requirement(r).name.lower().replace('_', '-') not in {'litellm-enterprise', 'ddtrace', 'ddtrace-internal'}
-                     for r in metadata.requires('litellm') or [])
-          assert not Path('/app/enterprise').exists()
-          root = Path(metadata.distribution('litellm').locate_file('litellm'))
-          assert not (root / 'proxy/enterprise').exists()
-          ui = root / 'proxy/_experimental/out'
-          assert (ui / 'LICENSE.litellm.txt').is_file()
-          assert (ui / 'THIRD_PARTY_NOTICES.txt').is_file()
-          from litellm.rust_bridge import _native
-          from litellm.proxy import proxy_server
-          assert proxy_server.enterprise_proxy_config is None
-          print('PASS absent Enterprise package/source/dependency; rebuilt OSS UI and Rust extension load')
-          PYCODE
-          for option in USE_DDTRACE USE_DDPROFILER; do
-            set +e
-            docker run --rm --network none -e "$option=true" "$LOCAL_IMAGE" --help > "$RUNNER_TEMP/datadog-guard.log" 2>&1
-            status=$?
-            set -e
-            test "$status" = 64
-          done
-          echo 'PASS explicit startup rejection for unsupported Datadog instrumentation'
-      - &layers
-        name: Check all exported layers for removed Enterprise paths
-        if: matrix.oss == 'litellm'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/check-image-layers.py" <<'PYCODE'
-          import json, re, sys, tarfile
-          restricted = re.compile(r'^(?:[.]/)?app/enterprise(/|$)|(^|/)site-packages/litellm_enterprise(/|$)|(^|/)site-packages/litellm_enterprise-[^/]+[.]dist-info(/|$)|(^|/)litellm/proxy/enterprise(/|$)|(^|/)site-packages/(ddtrace|_ddtrace_internal)(/|$)|(^|/)site-packages/(ddtrace|ddtrace_internal)-[^/]+[.]dist-info(/|$)|(^|/)bin/(ddtrace-run|_dd_crashtracker_receiver)$')
-          inspected, declared = set(), set()
-          entries = 0
-          with tarfile.open(fileobj=sys.stdin.buffer, mode='r|') as image:
-              for item in image:
-                  if not item.isfile():
-                      continue
-                  if item.name == 'manifest.json':
-                      for manifest in json.load(image.extractfile(item)):
-                          declared.update(manifest['Layers'])
-                  elif item.name.endswith('.tar') or re.fullmatch(r'blobs/sha256/[0-9a-f]{64}', item.name):
-                      # Docker save may use extensionless OCI blobs. JSON config
-                      # blobs are not tar archives; every declared layer must be.
-                      try:
-                          layer = tarfile.open(fileobj=image.extractfile(item), mode='r|*')
-                      except tarfile.ReadError:
-                          continue
-                      with layer:
-                          for member in layer:
-                              entries += 1
-                              if restricted.search(member.name):
-                                  raise SystemExit('Restricted Enterprise path retained in an image layer: ' + member.name)
-                      inspected.add(item.name)
-          assert declared and declared <= inspected, 'Not every manifest layer was inspected'
-          assert entries > 1000, 'No complete image payload inspected'
-          print(f'PASS {len(declared)} image layers / {entries} entries contain no restricted Enterprise paths')
-          PYCODE
-          docker save "$LOCAL_IMAGE" | python3 "$RUNNER_TEMP/check-image-layers.py"
-      - &httpx_security
-        name: Verify HTTPX security backport
-        if: matrix.oss == 'litellm'
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker run --rm -i --network none --entrypoint /app/.venv/bin/python "$LOCAL_IMAGE" - <<'PYCODE'
-          import asyncio
-          import gzip
-          import importlib.metadata as metadata
-          import sys
-          import json
-          import hashlib
-          from pathlib import Path
-          import zlib
-          import httpx
-          from packaging.version import Version
-
-          original = json.loads(Path('/usr/share/build-info/upstream-python.json').read_text())
-          runtime = json.loads(Path('/usr/share/build-info/runtime-python.json').read_text())
-          assert original['version'] == [3, 13, 18]
-          assert list(sys.version_info[:3]) == runtime['version'] == [3, 13, 18]
-          assert runtime['upstream_version'] == original['version']
-          assert runtime['upstream_binary_sha256'] == original['binary_sha256']
-          assert runtime['apk_version'] == '3.13.18_git20261030-r0'
-          assert hashlib.sha256(Path(sys.executable).resolve().read_bytes()).hexdigest() == runtime['binary_sha256']
-          assert runtime['binary_sha256'] == original['binary_sha256']
-          print('Python:', sys.version)
-          print('httpx:', metadata.version('httpx'), 'httpx2:', metadata.version('httpx2'))
-          assert sys.version_info[:3] == (3, 13, 18)
-          assert Version(metadata.version('httpx')) == Version('0.28.1+cvebackport.1')
-          assert Version(metadata.version('httpx2')) >= Version('2.12.0')
-
-          # Whole compressed data arrives in one transport chunk. Without bounded
-          # decompression this expands to over 4 MiB in a single output chunk.
-          plain = b'abcde' * (800 * 1024) + b'!'
-          assert len(plain) < 5 * 1024 * 1024
-          cases = {
-              'gzip': gzip.compress(plain),
-              'deflate': zlib.compress(plain),
-              'gzip, deflate': zlib.compress(gzip.compress(plain)),
-          }
-          def handler(request):
-              encoding = request.url.path.lstrip('/')
-              return httpx.Response(200, headers={'Content-Encoding': encoding},
-                                    stream=httpx.ByteStream(cases[encoding]))
-          def check(chunks):
-              assert chunks and max(map(len, chunks)) <= 1024 * 1024
-              assert b''.join(chunks) == plain
-          with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-              for encoding in cases:
-                  with client.stream('GET', f'http://local/{encoding}') as response:
-                      check(list(response.iter_bytes()))
-
-          async def check_async():
-              async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                  for encoding in cases:
-                      async with client.stream('GET', f'http://local/{encoding}') as response:
-                          check([chunk async for chunk in response.aiter_bytes()])
-          asyncio.run(check_async())
-
-          # Use the public request API to exercise serialization rather than the
-          # internal validator. CRLF in content-type/header values and invalid
-          # header names must fail; ordinary multipart metadata must still work.
-          for part in [
-              ('x.txt', b'data', 'text/plain\r\nX-Injected: yes'),
-              ('x.txt', b'data', 'text/plain', {'X-Valid': 'ok\r\nX-Injected: yes'}),
-              ('x.txt', b'data', 'text/plain', {'Bad Name': 'value'}),
-          ]:
-              try:
-                  httpx.Request('POST', 'http://local/', files={'file': part}).read()
-              except ValueError:
-                  pass
-              else:
-                  raise AssertionError(f'invalid multipart metadata accepted: {part!r}')
-          valid = httpx.Request('POST', 'http://local/', files={
-              'file': ('x.txt', b'valid payload', 'text/plain', {'X-Valid': 'yes'})
-          }).read()
-          assert b'valid payload' in valid and b'X-Valid: yes' in valid
-          # SDKs retain their normal HTTPX client types. All responses are local
-          # synthetic fixtures; no provider credentials or network are used.
-          import openai
-          import anthropic
-          model_list = {'data': [], 'object': 'list'}
-          message = {'id': 'msg_mock', 'type': 'message', 'role': 'assistant',
-                     'model': 'mock', 'content': [{'type': 'text', 'text': 'ok'}],
-                     'stop_reason': 'end_turn', 'stop_sequence': None,
-                     'usage': {'input_tokens': 1, 'output_tokens': 1}}
-          def sdk_handler(request):
-              return httpx.Response(200, json=message if request.url.path.endswith('/messages') else model_list)
-          with openai.OpenAI(api_key='local-test-only', http_client=httpx.Client(
-                  transport=httpx.MockTransport(sdk_handler))) as client:
-              assert client.models.list().data == []
-          with anthropic.Anthropic(api_key='local-test-only', http_client=httpx.Client(
-                  transport=httpx.MockTransport(sdk_handler))) as client:
-              assert client.messages.create(model='mock', max_tokens=1,
-                  messages=[{'role': 'user', 'content': 'test'}]).content[0].text == 'ok'
-          async def sdk_async():
-              async with openai.AsyncOpenAI(api_key='local-test-only', http_client=httpx.AsyncClient(
-                      transport=httpx.MockTransport(sdk_handler))) as client:
-                  assert (await client.models.list()).data == []
-              async with anthropic.AsyncAnthropic(api_key='local-test-only', http_client=httpx.AsyncClient(
-                      transport=httpx.MockTransport(sdk_handler))) as client:
-                  assert (await client.messages.create(model='mock', max_tokens=1,
-                      messages=[{'role': 'user', 'content': 'test'}])).content[0].text == 'ok'
-          asyncio.run(sdk_async())
-          print('PASS HTTPX security regressions and OpenAI/Anthropic sync/async SDKs')
-          PYCODE
-          docker run --rm -i --network none --entrypoint /opt/liteadmin/bin/python "$LOCAL_IMAGE" - <<'PYCODE'
-          import importlib.metadata as metadata
-          import sys
-          print('Admin Python:', sys.version)
-          print('Admin httpx2:', metadata.version('httpx2'))
-          assert sys.version_info[:3] == (3, 13, 18)
-          assert metadata.version('httpx2') == '2.13.0'  # fixed, no packaging dependency
-          PYCODE
-      - &runtime
-        name: Verify LiteLLM API, authentication, streaming, UI and persistent database
-        if: matrix.oss == 'litellm'
-        shell: bash
-        run: |
-          set -euo pipefail
-          smoke_dir="$RUNNER_TEMP/litellm-smoke"
-          mkdir -p "$smoke_dir"
-          chmod 700 "$smoke_dir"
-          cat > "$smoke_dir/config.yaml" <<'CONFIG'
-          model_list:
-            - model_name: mock
-              litellm_params:
-                model: openai/mock
-                api_key: sk-public-local-mock-only
-                mock_response: ok
-          general_settings:
-            master_key: os.environ/LITELLM_MASTER_KEY
-            database_url: os.environ/DATABASE_URL
-          CONFIG
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$LOCAL_IMAGE")" = '["docker-entrypoint.sh"]'
+          test "$(docker image inspect --format '{{json .Config.Cmd}}' "$LOCAL_IMAGE")" = '["postgres"]'
           # These fresh random values are for this isolated disposable test only.
-          master_key="sk-$(openssl rand -hex 24)"
-          db_password="$(openssl rand -hex 24)"
-          echo "::add-mask::$master_key"
-          echo "::add-mask::$db_password"
-          docker pull postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
-          docker network create --internal ci-smoke
-          docker run -d --name ci-postgres --network ci-smoke \
-            -e "POSTGRES_PASSWORD=$db_password" -e POSTGRES_DB=litellm postgres:16-alpine@sha256:0cefaabd882e42bcb2a2f3dc56d3ce4770560ba62fd7f197f1a2e008fd5731ab
-          for attempt in $(seq 1 60); do
-            if docker exec ci-postgres pg_isready -U postgres -d litellm >/dev/null; then break; fi
-            sleep 2
-          done
-          docker exec ci-postgres pg_isready -U postgres -d litellm
-          # No external network, host ports, real provider credentials or company data.
-          docker run -d --name ci-proxy --network ci-smoke \
-            -e "DATABASE_URL=postgresql://postgres:$db_password@ci-postgres:5432/litellm" \
-            -e "LITELLM_MASTER_KEY=$master_key" -e LITELLM_LOCAL_MODEL_COST_MAP=True \
-            --mount "type=bind,src=$smoke_dir/config.yaml,dst=/ci/config.yaml,readonly" \
-            "$LOCAL_IMAGE" --config /ci/config.yaml --port 4000
-          cat > "$smoke_dir/check.py" <<'PY'
-          import json, os, pathlib, sys, time
-          import httpx
-          from urllib.parse import urljoin, urlsplit
-          key = os.environ['LITELLM_MASTER_KEY']
-          client = httpx.Client(base_url='http://127.0.0.1:4000', trust_env=False,
-                                timeout=30, follow_redirects=False)
-          def request(method, path, token=key, expected=200, **kwargs):
-              response = client.request(method, path,
-                  headers={'Authorization': 'Bearer ' + token} if token else {}, **kwargs)
-              allowed = (expected,) if isinstance(expected, int) else expected
-              assert response.status_code in allowed, path + ': HTTP ' + str(response.status_code)
-              return response
-          for attempt in range(120):
-              try:
-                  if client.get('/health/readiness', headers={'Authorization': 'Bearer ' + key}).status_code == 200:
-                      break
-              except httpx.HTTPError:
-                  pass
-              time.sleep(2)
-          else:
-              raise SystemExit('LiteLLM did not become ready')
-          for path in ('/health/liveliness', '/health/readiness'):
-              assert request('GET', path).content, 'empty health response'
-          saved = pathlib.Path('/tmp/ci-virtual-key')
-          payload = {'model': 'mock', 'messages': [{'role': 'user', 'content': 'public CI mock'}]}
-          if len(sys.argv) > 1 and sys.argv[1] == 'existing-db':
-              virtual_key = saved.read_text()
-              info = request('GET', '/key/info', params={'key': virtual_key}).json()
-              assert 'mock' in info['info']['models'], 'persisted key lost model authorization'
-              assert request('POST', '/v1/chat/completions', token=virtual_key,
-                             json=payload).json()['choices'][0]['message']['content'] == 'ok'
-              request('POST', '/key/delete', json={'keys': [virtual_key]})
-              saved.unlink()
-              print('PASS restarted proxy retains PostgreSQL key and serves authenticated mock')
-              raise SystemExit(0)
-          ui = request('GET', '/ui', token=None, expected=(200, 301, 302, 303, 307, 308))
-          for attempt in range(5):
-              if ui.status_code == 200:
-                  break
-              target = urlsplit(urljoin(str(ui.url), ui.headers['location']))
-              assert target.hostname == '127.0.0.1' and target.port == 4000 and target.scheme == 'http'
-              ui = request('GET', target.path, token=None, expected=(200, 301, 302, 303, 307, 308))
-          assert ui.status_code == 200 and b'<html' in ui.content.lower(), 'UI HTML missing'
-          for token in (None, 'sk-invalid-local-ci'):
-              request('POST', '/v1/chat/completions', token=token, json=payload, expected=(401, 403))
-          request('POST', '/key/generate', token=None, json={'models': ['mock']}, expected=(401, 403))
-          virtual_key = request('POST', '/key/generate',
-                                json={'models': ['mock'], 'duration': '1h'}).json()['key']
-          # Private temporary receipt survives proxy restart, not the CI job.
-          saved.touch(mode=0o600)
-          saved.write_text(virtual_key)
-          info = request('GET', '/key/info', params={'key': virtual_key}).json()
-          assert 'mock' in info['info']['models']
-          request('POST', '/key/update', json={'key': virtual_key, 'key_alias': 'public-ci-smoke'})
-          assert request('GET', '/key/info', params={'key': virtual_key}).json()['info']['key_alias'] == 'public-ci-smoke'
-          result = request('POST', '/v1/chat/completions', token=virtual_key, json=payload).json()
-          assert result['choices'][0]['message']['content'] == 'ok'
-          chunks, done = [], False
-          with client.stream('POST', '/v1/chat/completions',
-                  headers={'Authorization': 'Bearer ' + virtual_key}, json={**payload, 'stream': True}) as response:
-              assert response.status_code == 200
-              assert 'text/event-stream' in response.headers.get('content-type', '')
-              for line in response.iter_lines():
-                  if not line.startswith('data:'):
-                      continue
-                  data = line[5:].strip()
-                  if data == '[DONE]':
-                      done = True
-                      break
-                  event = json.loads(data)
-                  assert 'error' not in event
-                  chunks.extend(c.get('delta', {}).get('content') or '' for c in event.get('choices', []))
-          assert done and ''.join(chunks) == 'ok', 'SSE mock response mismatch'
-          print('PASS health, UI, auth, key create/read/update, nonstream and stream mock API')
-          PY
-          docker exec -i ci-proxy /app/.venv/bin/python - < "$smoke_dir/check.py"
-          docker restart ci-proxy
-          docker exec -i ci-proxy /app/.venv/bin/python - existing-db < "$smoke_dir/check.py"
-      - &cleanup
-        name: Remove disposable smoke resources
-        if: always() && matrix.oss == 'litellm'
-        shell: bash
-        run: |
-          docker rm -f ci-proxy ci-postgres >/dev/null 2>&1 || true
-          docker network rm ci-smoke >/dev/null 2>&1 || true
+          app_password="$(openssl rand -hex 24)"
+          root_password="$(openssl rand -hex 24)"
+          wrong_password="$(openssl rand -hex 24)"
+          echo "::add-mask::$app_password"
+          echo "::add-mask::$root_password"
+          trap 'docker rm -f -v ci-pg70 ci-pgroot >/dev/null 2>&1 || true; docker volume rm ci-pg70 ci-pgroot >/dev/null 2>&1 || true; docker network rm ci-pg >/dev/null 2>&1 || true' EXIT
+          # No external network, host ports or real credentials.
+          docker network create --internal ci-pg >/dev/null
+          docker volume create ci-pg70 >/dev/null
+          docker volume create ci-pgroot >/dev/null
+          # As uid 70 the entrypoint initialises PGDATA in a subdirectory of a
+          # group-writable volume.
+          docker run --rm --user 0 --network none -v ci-pg70:/v --entrypoint sh "$LOCAL_IMAGE" -c 'chown 0:70 /v && chmod 2775 /v'
+          run70() {
+            docker run -d --name ci-pg70 --network ci-pg --user 70:70 --read-only --cap-drop ALL \
+              --security-opt no-new-privileges --tmpfs /var/run/postgresql --tmpfs /tmp \
+              -v ci-pg70:/var/lib/postgresql/data -e PGDATA=/var/lib/postgresql/data/pgdata \
+              -e POSTGRES_USER=app -e POSTGRES_DB=app -e "POSTGRES_PASSWORD=$app_password" "$LOCAL_IMAGE" >/dev/null
+          }
+          # The temporary server of the first start listens on the socket only; wait for TCP.
+          wait_ready() {
+            for attempt in $(seq 1 60); do
+              if docker exec "$1" pg_isready -h 127.0.0.1 -U "$2" -d "$2" >/dev/null 2>&1; then return 0; fi
+              sleep 2
+            done
+            docker logs "$1"
+            return 1
+          }
+          # Connections from inside the server container are trusted by pg_hba; a
+          # second container on the network must pass scram-sha-256.
+          client() {
+            local host=$1 user=$2 password=$3
+            shift 3
+            docker run --rm --network ci-pg -e "PGPASSWORD=$password" --entrypoint psql "$LOCAL_IMAGE" \
+              -v ON_ERROR_STOP=1 -qAt -h "$host" -U "$user" -d "$user" "$@"
+          }
+          run70
+          wait_ready ci-pg70 app
+          test "$(docker exec ci-pg70 stat -c %u /proc/1)" = 70
+          test "$(client ci-pg70 app "$app_password" -c 'SELECT system_user')" = scram-sha-256:app
+          if client ci-pg70 app "$wrong_password" -c 'SELECT 1' >/dev/null 2>&1; then
+            echo '::error::A wrong password was accepted'
+            exit 1
+          fi
+          client ci-pg70 app "$app_password" -c 'CREATE TABLE t(x int)' -c 'INSERT INTO t VALUES (1)'
+          test "$(client ci-pg70 app "$app_password" -c "SELECT (xpath('/a/text()', xmlparse(document '<a>1</a>')))[1]::text")" = 1
+          test "$(client ci-pg70 app "$app_password" -c "SELECT encode(sha256('abc'), 'hex')")" = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          docker stop ci-pg70 >/dev/null
+          docker rm ci-pg70 >/dev/null
+          run70
+          wait_ready ci-pg70 app
+          test "$(client ci-pg70 app "$app_password" -c 'SELECT count(*) FROM t')" = 1
+          docker logs ci-pg70 2>&1 | grep -q 'Skipping initialization'
+          # As root the unchanged entrypoint drops to postgres through gosu (su-exec).
+          docker run -d --name ci-pgroot --network ci-pg -e "POSTGRES_PASSWORD=$root_password" \
+            -v ci-pgroot:/var/lib/postgresql/data "$LOCAL_IMAGE" >/dev/null
+          wait_ready ci-pgroot postgres
+          test "$(docker exec ci-pgroot readlink /usr/local/bin/gosu)" = /sbin/su-exec
+          test "$(docker exec ci-pgroot stat -c %U /proc/1)" = postgres
+          test "$(docker exec ci-pgroot stat -c %U /var/lib/postgresql/data/PG_VERSION)" = postgres
+          test "$(client ci-pgroot postgres "$root_password" -c 'SELECT system_user')" = scram-sha-256:postgres
+          echo 'PASS uid 70 read-only and root starts, restart on the same volume, scram-sha-256 logins over a network'
       - &scanner
         name: Install checksum-pinned Trivy 0.76.1
         shell: bash
@@ -803,7 +600,7 @@ jobs:
                   package = json.load(response)
           except urllib.error.HTTPError as error:
               if error.code == 404 and sys.argv[1] == 'before':
-                  print('New package: the first push may require the owner to set Public in Package settings.')
+                  print('New package: the push below creates it; its visibility is checked after the push.')
                   raise SystemExit(0)
               raise
           assert package['name'] == name and package['package_type'] == 'container'
@@ -817,11 +614,7 @@ jobs:
       - *build
       - *release_build_cache
       - *vllm_runtime
-      - *exclusion
-      - *layers
-      - *httpx_security
-      - *runtime
-      - *cleanup
+      - *postgres_runtime
       - *scanner
       - *scan
       - *identity
@@ -941,6 +734,7 @@ jobs:
           fi
           podman --version
       - name: Publish version tags and verify anonymous Podman pull
+        id: publish
         if: steps.published.outputs.state == 'absent'
         env:
           FIXED_TAG: ${{ steps.published.outputs.tag }}
@@ -965,14 +759,6 @@ jobs:
           image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
           [[ "$image_version" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,126}$ ]]
           fixed_tag="v$image_version"
-          alias_tag="$fixed_tag"
-          if [ "$OSS" = litellm ]; then
-            base_name="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.base.name"}}' "$LOCAL_IMAGE")"
-            [[ "$base_name" == ghcr.io/berriai/litellm:v* ]]
-            alias_tag="${base_name##*:}"
-            [[ "$alias_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-            [[ "$fixed_tag" == "$alias_tag-oss-"* ]]
-          fi
           python3 "$RUNNER_TEMP/check-package-visibility.py" before
           # Never re-point a published version tag; recheck right before pushing.
           test "$fixed_tag" = "$FIXED_TAG"
@@ -987,17 +773,15 @@ jobs:
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
           # The version tag goes last: if a push stops early, the version still reads
           # as absent and a re-run pushes the whole set again.
-          tags=("sha-$GITHUB_SHA")
-          [ "$alias_tag" = "$fixed_tag" ] || tags+=("$alias_tag")
-          tags+=("$fixed_tag")
+          tags=("sha-$GITHUB_SHA" "$fixed_tag")
           for tag in "${tags[@]}"; do
             docker tag "$image_id" "$registry_image:$tag"
             docker push "$registry_image:$tag"
           done
-          expected_digest="$(docker image inspect "$registry_image:$alias_tag" | python3 -c 'import json,sys; repo=sys.argv[1]; matches=[s.split("@",1)[1] for s in json.load(sys.stdin)[0]["RepoDigests"] if s.startswith(repo+"@")]; assert len(set(matches))==1; print(matches[0])' "$registry_image")"
-          # Recorded before the visibility check: a new private package needs this
-          # tag, digest and image ID for Verify published image with Podman after it is
-          # set Public.
+          expected_digest="$(docker image inspect "$registry_image:$fixed_tag" | python3 -c 'import json,sys; repo=sys.argv[1]; matches=[s.split("@",1)[1] for s in json.load(sys.stdin)[0]["RepoDigests"] if s.startswith(repo+"@")]; assert len(set(matches))==1; print(matches[0])' "$registry_image")"
+          # Recorded before the visibility check: a package that is not public needs
+          # this tag, digest and image ID for Verify published image with Podman after
+          # it is set Public.
           printf 'Pushed `%s`: %s\n\nDigest: `%s`\n\nImage ID: `%s`\n\n' \
             "$registry_image" "${tags[*]}" "$expected_digest" "$image_id" >> "$GITHUB_STEP_SUMMARY"
           python3 "$RUNNER_TEMP/check-package-visibility.py" after
@@ -1005,12 +789,252 @@ jobs:
           # A fresh, empty authfile proves consumers can pull without a login.
           umask 077
           printf '{"auths":{}}\n' > "$podman_auth"
-          podman pull --authfile "$podman_auth" --arch amd64 "$registry_image:$alias_tag"
-          pulled_id="$(podman image inspect --format '{{.Id}}' "$registry_image:$alias_tag")"
+          podman pull --authfile "$podman_auth" --arch amd64 "$registry_image:$fixed_tag"
+          pulled_id="$(podman image inspect --format '{{.Id}}' "$registry_image:$fixed_tag")"
           test "${pulled_id#sha256:}" = "${image_id#sha256:}"
-          test "$(podman image inspect --format '{{.Os}}/{{.Architecture}}' "$registry_image:$alias_tag")" = linux/amd64
-          digest="$(podman image inspect --format '{{.Digest}}' "$registry_image:$alias_tag")"
+          test "$(podman image inspect --format '{{.Os}}/{{.Architecture}}' "$registry_image:$fixed_tag")" = linux/amd64
+          digest="$(podman image inspect --format '{{.Digest}}' "$registry_image:$fixed_tag")"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           test "$digest" = "$expected_digest"
-          printf 'Public package, verified by anonymous Podman pull: `%s:%s`\n\nCustom version: `%s:%s`\n\nDigest: `%s@%s`\n' \
-            "$registry_image" "$alias_tag" "$registry_image" "$fixed_tag" "$registry_image" "$digest" >> "$GITHUB_STEP_SUMMARY"
+          printf 'Public package, verified by anonymous Podman pull: `%s:%s`\n\nDigest: `%s@%s`\n' \
+            "$registry_image" "$fixed_tag" "$registry_image" "$digest" >> "$GITHUB_STEP_SUMMARY"
+      # Only the newest version of a package is kept. This runs on main only, after
+      # this job pushed v<version label> and pulled it anonymously, or found it
+      # already published (then the version is checked anonymously here first).
+      - name: Delete every other version of this package
+        if: >-
+          github.ref == 'refs/heads/main' && github.event_name != 'pull_request' &&
+          ((steps.published.outputs.state == 'absent' && steps.publish.outcome == 'success') ||
+           steps.published.outputs.state == 'published')
+        env:
+          FIXED_TAG: ${{ steps.published.outputs.tag }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISHED_STATE: ${{ steps.published.outputs.state }}
+          REGISTRY_OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          registry_image="ghcr.io/${REGISTRY_OWNER,,}/$OSS"
+          image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$LOCAL_IMAGE")"
+          test "v$image_version" = "$FIXED_TAG"
+          pushed_digest=''
+          if [ "$PUBLISHED_STATE" = absent ]; then
+            # The digest the previous step pushed and pulled anonymously.
+            pushed_digest="$(docker image inspect "$registry_image:$FIXED_TAG" | python3 -c 'import json,sys; repo=sys.argv[1]; matches=[s.split("@",1)[1] for s in json.load(sys.stdin)[0]["RepoDigests"] if s.startswith(repo+"@")]; assert len(set(matches))==1; print(matches[0])' "$registry_image")"
+          fi
+          cat > "$RUNNER_TEMP/prune-package.py" <<'PYCODE'
+          import datetime, hashlib, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+          # Keeps exactly the version of ghcr.io/<owner>/<recipe> that v<label> points to
+          # and deletes every other version (older v<...> and sha-<commit> tags and
+          # untagged manifests) through the packages REST API. It deletes nothing unless
+          # v<label> resolves anonymously to a single-platform manifest, the listing has
+          # exactly one version with that digest and tag, and no other version was created
+          # after it; any other answer fails.
+          API = 'https://api.github.com'
+          DIGEST = re.compile(r'sha256:[0-9a-f]{64}\Z')
+          SINGLE = ('application/vnd.docker.distribution.manifest.v2+json',
+                    'application/vnd.oci.image.manifest.v1+json')
+          INDEX = ('application/vnd.oci.image.index.v1+json',
+                   'application/vnd.docker.distribution.manifest.list.v2+json')
+          MANUAL = ('The job token can delete versions only of a package whose Manage Actions access '
+                    'gives this repository the Admin role (the default for a package this workflow '
+                    'created). Give it that role in the package settings and re-run, or delete the '
+                    'other versions by hand: package page, View and manage all versions, Delete version.')
+          ATTEMPTS, PAUSE = 6, 10
+          sleep = time.sleep
+
+          def fetch(method, url, headers):
+              # HTTP statuses are answers; transport errors propagate and fail the step.
+              request = urllib.request.Request(url, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return response.status, response.headers, response.read()
+              except urllib.error.HTTPError as error:
+                  return error.code, error.headers, error.read()
+
+          def api_headers(token):
+              return {'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
+                      'X-GitHub-Api-Version': '2022-11-28'}
+
+          def message(body):
+              try:
+                  text = json.loads(body).get('message', '')
+              except (ValueError, AttributeError):
+                  text = body.decode(errors='replace')
+              return ' '.join(str(text).split())[:300]
+
+          def anonymous_manifest(repository, tag):
+              # Without credentials, as a consumer pulls: proves the tag is public and
+              # returns its manifest digest and media type.
+              query = urllib.parse.urlencode({'service': 'ghcr.io', 'scope': f'repository:{repository}:pull'})
+              status, _, body = fetch('GET', 'https://ghcr.io/token?' + query, {})
+              if status != 200:
+                  raise SystemExit(f'Anonymous GHCR token request answered HTTP {status}')
+              token = json.loads(body).get('token')
+              if not isinstance(token, str) or not token:
+                  raise SystemExit('Anonymous GHCR token response has no token')
+              status, headers, body = fetch('GET', f'https://ghcr.io/v2/{repository}/manifests/{tag}', {
+                  'Authorization': 'Bearer ' + token, 'Accept': ', '.join(SINGLE + INDEX)})
+              if status != 200:
+                  raise SystemExit(f'Anonymous pull of {repository}:{tag} answered HTTP {status}')
+              digest = headers.get('Docker-Content-Digest', '')
+              media_type = (headers.get('Content-Type') or '').split(';')[0].strip()
+              if not DIGEST.match(digest) or 'sha256:' + hashlib.sha256(body).hexdigest() != digest:
+                  raise SystemExit('GHCR returned a manifest whose digest does not match')
+              if json.loads(body).get('mediaType', media_type) != media_type:
+                  raise SystemExit('GHCR returned a manifest with conflicting media types')
+              if media_type in INDEX:
+                  # The platform manifests of an index are listed as untagged versions.
+                  raise SystemExit(f'{repository}:{tag} is an image index; refusing to delete versions, '
+                                   'because its platform manifests are listed as untagged versions')
+              if media_type not in SINGLE:
+                  raise SystemExit(f'Unexpected manifest media type {media_type!r}')
+              return digest
+
+          def next_page(link, owner, name):
+              # Follows rel="next" only to the versions listing of the same package.
+              for part in (link or '').split(','):
+                  if not part.strip():
+                      continue
+                  match = re.fullmatch(r'\s*<([^<>]+)>\s*;\s*rel="([a-z ]+)"\s*', part)
+                  if not match:
+                      raise SystemExit('Unexpected Link header in the versions listing')
+                  if 'next' in match.group(2).split():
+                      url = urllib.parse.urlsplit(match.group(1))
+                      if (url.scheme, url.netloc) != ('https', 'api.github.com') or not re.fullmatch(
+                              r'/(?:(?i:users/' + re.escape(owner) + r')|user/[0-9]+)/packages/container/'
+                              + re.escape(name) + r'/versions', url.path):
+                          raise SystemExit('Unexpected next page in the versions listing')
+                      return match.group(1)
+              return None
+
+          def list_versions(owner, name, token):
+              url = f'{API}/users/{owner}/packages/container/{name}/versions?per_page=100'
+              versions, pages = [], 0
+              while url:
+                  pages += 1
+                  if pages > 50:
+                      raise SystemExit('More than 50 pages of versions; refusing to decide')
+                  status, headers, body = fetch('GET', url, api_headers(token))
+                  if status != 200:
+                      hint = ' ' + MANUAL if status in (401, 403, 404) else ''
+                      raise SystemExit(f'Listing versions answered HTTP {status}: {message(body)}.{hint}')
+                  page = json.loads(body)
+                  if not isinstance(page, list):
+                      raise SystemExit('The versions listing is not a list')
+                  versions.extend(page)
+                  url = next_page(headers.get('Link'), owner, name)
+              return versions
+
+          def created(version):
+              value = version.get('created_at')
+              try:
+                  moment = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+              except (AttributeError, ValueError):
+                  raise SystemExit(f"Version {version.get('id')} has no valid created_at")
+              if moment.tzinfo is None:
+                  raise SystemExit(f"Version {version.get('id')} has no valid created_at")
+              return moment
+
+          def select(versions, digest, tag):
+              # Returns (current, others), or None while no version is both named by the
+              # digest of v<label> and the only one carrying that tag.
+              ids, names, tags = set(), set(), {}
+              for version in versions:
+                  if not isinstance(version, dict):
+                      raise SystemExit('Malformed version in the listing')
+                  vid, name = version.get('id'), version.get('name')
+                  metadata = version.get('metadata')
+                  if not isinstance(metadata, dict) or metadata.get('package_type') != 'container':
+                      raise SystemExit('Malformed version in the listing')
+                  container = metadata.get('container')
+                  labels = container.get('tags') if isinstance(container, dict) else None
+                  if (type(vid) is not int or vid <= 0 or not isinstance(name, str) or not DIGEST.match(name)
+                          or not isinstance(labels, list)
+                          or not all(isinstance(label, str) and label for label in labels)):
+                      raise SystemExit('Malformed version in the listing')
+                  if vid in ids or name in names:
+                      raise SystemExit(f'The listing repeats version {vid} or digest {name}')
+                  ids.add(vid)
+                  names.add(name)
+                  for label in labels:
+                      if label in tags:
+                          raise SystemExit(f'Tag {label} is listed on more than one version')
+                      tags[label] = vid
+                  created(version)
+              current = [version for version in versions if version['name'] == digest]
+              if len(current) != 1 or tags.get(tag) != current[0]['id']:
+                  return None
+              others = [version for version in versions if version is not current[0]]
+              newer = [version for version in others if created(version) > created(current[0])]
+              if newer:
+                  # Only the newest version is kept: never delete one created after v<label>,
+                  # as after a lowered label.
+                  raise SystemExit(f"Version {newer[0]['id']} was created after {tag}; a newer version "
+                                   'exists, so nothing was deleted')
+              return current[0], others
+
+          def main():
+              tag, pushed = sys.argv[1], sys.argv[2]
+              owner, name, token = os.environ['REGISTRY_OWNER'], os.environ['OSS'], os.environ['GHCR_TOKEN']
+              if os.environ.get('GITHUB_REF') != 'refs/heads/main' or os.environ.get('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch'):
+                  raise SystemExit('Versions are deleted only by push and manual runs on main')
+              if not (token and re.fullmatch(r'v[a-zA-Z0-9_.-]{1,127}', tag)
+                      and re.fullmatch(r'[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?', name)
+                      and re.fullmatch(r'[A-Za-z0-9-]+', owner) and (not pushed or DIGEST.match(pushed))):
+                  raise SystemExit('Unexpected arguments')
+              repository = f'{owner.lower()}/{name}'
+              digest = anonymous_manifest(repository, tag)
+              if pushed and digest != pushed:
+                  raise SystemExit(f'{tag} resolves to {digest}, not to the pushed {pushed}')
+              # A new version can take a moment to appear in the listing.
+              for attempt in range(ATTEMPTS):
+                  if attempt:
+                      sleep(PAUSE)
+                  selected = select(list_versions(owner, name, token), digest, tag)
+                  if selected:
+                      break
+              else:
+                  raise SystemExit(f'The listing has no single version {digest} tagged {tag}; nothing was deleted')
+              current, others = selected
+              status, _, body = fetch('GET', f"{API}/repos/{os.environ['GITHUB_REPOSITORY']}/git/ref/heads/main",
+                                      api_headers(token))
+              if status != 200:
+                  raise SystemExit(f'Reading the main ref answered HTTP {status}: {message(body)}; nothing was deleted')
+              if json.loads(body)['object']['sha'] != os.environ['GITHUB_SHA']:
+                  raise SystemExit('Main advanced; refusing to delete versions from an older revision')
+              summary = open(os.environ['GITHUB_STEP_SUMMARY'], 'a')
+              def row(action, version):
+                  summary.write(f"| {action} | {version['id']} | {' '.join(version['metadata']['container']['tags']) or '(untagged)'} | `{version['name']}` |\n")
+                  summary.flush()
+              summary.write(f'\nVersions of `ghcr.io/{repository}`:\n\n| Action | Version ID | Tags | Digest |\n|---|---|---|---|\n')
+              row('Kept', current)
+              refused = []
+              for version in others:
+                  status, _, body = fetch('DELETE', f"{API}/users/{owner}/packages/container/{name}/versions/{version['id']}",
+                                          api_headers(token))
+                  if status == 204:
+                      row('Deleted', version)
+                      print(f"Deleted version {version['id']} ({version['name']})")
+                      continue
+                  text = message(body)
+                  if status in (400, 409, 422) and 'download' in text.lower():
+                      # GitHub keeps public versions with more than 5,000 downloads.
+                      row(f'Refused by GitHub (HTTP {status}, {text})', version)
+                      refused.append(version)
+                      continue
+                  row(f'Stopped (HTTP {status}, {text})', version)
+                  raise SystemExit(f"Deleting version {version['id']} answered HTTP {status}: {text}. "
+                                   'Nothing else was deleted. ' + (MANUAL if status in (401, 403, 404) else ''))
+              if anonymous_manifest(repository, tag) != digest:
+                  raise SystemExit(f'{tag} no longer resolves to {digest}')
+              if refused:
+                  raise SystemExit(f'GitHub refused to delete {len(refused)} version(s): it keeps public versions '
+                                   'with more than 5,000 downloads; only GitHub Support can remove them. '
+                                   f'{tag} is unchanged.')
+              print(f'Kept only {tag} ({digest}); deleted {len(others)} other version(s)')
+
+          if __name__ == '__main__':
+              main()
+          PYCODE
+          python3 "$RUNNER_TEMP/prune-package.py" "$FIXED_TAG" "$pushed_digest"

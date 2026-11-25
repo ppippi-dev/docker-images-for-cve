@@ -1,16 +1,16 @@
 # Recheck an existing registry image without rebuilding or publishing it.
+# Only the newest version of each package is kept (see build-images.yml).
 name: Verify published image with Podman
 
 on:
   workflow_dispatch:
     inputs:
       image:
-        description: 'OSS package name (for example litellm)'
+        description: 'OSS package name (for example vllm)'
         required: true
-        default: litellm
         type: string
       tag:
-        description: 'Published tag (for example v1.106.6)'
+        description: 'Published tag (for example v0.34.0-oss-r2)'
         required: true
         type: string
       digest:
