@@ -176,6 +176,7 @@ jobs:
           test "$(docker image inspect --format '{{.Config.User}}' "$LOCAL_IMAGE")" = 2000:0
           test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$LOCAL_IMAGE")" = '["vllm","serve"]'
           test "$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$LOCAL_IMAGE")" = '{"8000/tcp":{}}'
+          test "$(docker image inspect --format '{{.Config.WorkingDir}}' "$LOCAL_IMAGE")" = /vllm-workspace
           # No GPU on hosted runners: offline, non-root, read-only root filesystem with
           # writable tmpfs for /tmp and the cache home, as a hardened deployment would use.
           run=(docker run --rm -i --network none --read-only --cap-drop ALL --security-opt no-new-privileges
@@ -235,6 +236,31 @@ jobs:
             fi
           done
           echo 'PASS entrypoint vllm serve --help=all (no GPU, no network, read-only root)'
+          # Any other UID and GID (as a deployment with runAsUser/runAsGroup sets) with its
+          # own writable HOME: the working directory must be readable and the CLI must start.
+          other=(docker run --rm -i --network none --read-only --cap-drop ALL --security-opt no-new-privileges
+                 --user 65534:65534 -e HOME=/cache --tmpfs /tmp:rw,exec,mode=1777 --tmpfs /cache:rw,exec,mode=1777)
+          "${other[@]}" --entrypoint /opt/vllm/bin/python "$LOCAL_IMAGE" -I - <<'PYCODE'
+          import os
+          from pathlib import Path
+          assert (os.getuid(), os.getgid()) == (65534, 65534)
+          assert os.getcwd() == '/vllm-workspace' and os.listdir('.') == []
+          assert not os.access('/home/vllm', os.X_OK)
+          probe = Path.home() / '.cache/probe'
+          probe.parent.mkdir(parents=True, exist_ok=True)
+          probe.write_text('ok')
+          import torch, triton, vllm
+          assert vllm.__version__ == '0.34.0'
+          print('PASS imports and working directory as UID/GID 65534')
+          PYCODE
+          other_log="$RUNNER_TEMP/vllm-serve-help-other.log"
+          if ! "${other[@]}" -e VLLM_TARGET_DEVICE=cpu "$LOCAL_IMAGE" --help=all > "$other_log" 2>&1 ||
+             ! grep -q -e '^usage: vllm serve' "$other_log"; then
+            cat "$other_log"
+            echo "::error::vllm serve --help=all failed as UID/GID 65534"
+            exit 1
+          fi
+          echo 'PASS entrypoint vllm serve --help=all as UID/GID 65534'
       - &exclusion
         name: Verify Enterprise components are absent from LiteLLM
         if: matrix.oss == 'litellm'

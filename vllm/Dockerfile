@@ -37,7 +37,7 @@
 # - Preserve upstream license notices; an image contains multiple licenses.
 # - Main publishes each image.version once as v<image.version>; a published
 #   version tag is never re-pointed. Raise the rN suffix of image.version
-#   (0.34.0-oss-r1 -> -r2) to publish a rebuild of the same vLLM version.
+#   (0.34.0-oss-r2 -> -r3) to publish a rebuild of the same vLLM version.
 #
 # CHANGES AGAINST THE UPSTREAM IMAGE (docker.io/vllm/vllm-openai, Ubuntu 24.04)
 # - Base: AL2023 minimal with python3.12, python3.12-devel and gcc only; no CUDA
@@ -60,13 +60,19 @@
 #   vllm-openai-nonroot target; numeric USER for runAsNonRoot. Caches resolve
 #   under $HOME (.cache, .triton) and /tmp: with a read-only root filesystem
 #   mount $HOME and /tmp writable and executable. Usage statistics off; EXPOSE 8000; ENTRYPOINT vllm serve.
+# - Working directory /vllm-workspace (the upstream path), owned by root and
+#   readable by everyone, so the container also starts under another UID and
+#   GID (CI starts it as 65534:65534). Such a user cannot write /home/vllm: set
+#   HOME, or the cache variables, to a writable directory. Relative paths
+#   resolve against /vllm-workspace, which only root can write (r1 used
+#   /home/vllm): pass absolute paths.
 #
 # Build (linux/amd64 only; no local build context is sent; ~30 GB free disk):
-#   docker build --platform linux/amd64 -t vllm-cve:0.34.0-oss-r1 - < vllm/Dockerfile
+#   docker build --platform linux/amd64 -t vllm-cve:0.34.0-oss-r2 - < vllm/Dockerfile
 # Supplementary public scan (run outside this repository):
 #   trivy image --scanners vuln --ignorefile '' --ignore-unfixed=false \
 #     --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
-#     vllm-cve:0.34.0-oss-r1
+#     vllm-cve:0.34.0-oss-r2
 # Scan the exact image with your own scanner and policy before use.
 #
 # Baseline: public vllm/vllm-openai:v0.34.0-x86_64, Trivy 0.76.2, DB 2026-11-24:
@@ -410,6 +416,9 @@ set -eu
 printf 'vllm:x:2000:0:vLLM:/home/vllm:/bin/bash\n' >> /etc/passwd
 printf 'vllm:!!:::::::\n' >> /etc/shadow
 install -d -m 0770 -o 2000 -g 0 /home/vllm /home/vllm/.cache /home/vllm/.config
+# The working directory must be enterable by any UID and GID: a process whose
+# working directory it cannot read fails on the first relative path.
+install -d -m 0755 -o 0 -g 0 /vllm-workspace
 SH
 
 # uv exists only during this RUN; the venv is created without pip. Every wheel
@@ -457,7 +466,7 @@ PY
 SH
 
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="0.34.0-oss-r1" \
+      org.opencontainers.image.version="0.34.0-oss-r2" \
       org.opencontainers.image.base.name="public.ecr.aws/amazonlinux/amazonlinux:2023.12.20261120.0-minimal" \
       org.opencontainers.image.base.digest="sha256:75a2d4226d9b98c914d7eed878a03bef4f365ad548be5d28d464ccba504cec79" \
       org.opencontainers.image.description="vLLM 0.34.0 OpenAI-compatible server rebuilt on Amazon Linux 2023 minimal from hash-locked PyPI wheels for linux/amd64; requires a fresh vulnerability scan before use"
@@ -469,7 +478,7 @@ ENV PATH="/opt/vllm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
     NVIDIA_DRIVER_CAPABILITIES="compute,utility" \
     VLLM_NO_USAGE_STATS="1" \
     DO_NOT_TRACK="1"
-WORKDIR /home/vllm
+WORKDIR /vllm-workspace
 USER 2000:0
 EXPOSE 8000/tcp
 ENTRYPOINT ["vllm", "serve"]
