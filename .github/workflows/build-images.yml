@@ -375,6 +375,93 @@ jobs:
           test "$(docker exec ci-pgroot stat -c %U /var/lib/postgresql/data/PG_VERSION)" = postgres
           test "$(client ci-pgroot postgres "$root_password" -c 'SELECT system_user')" = scram-sha-256:postgres
           echo 'PASS uid 70 read-only and root starts, restart on the same volume, scram-sha-256 logins over a network'
+      - &apisix_runtime
+        name: Verify APISIX libraries and a non-root standalone proxy request
+        if: matrix.oss == 'apisix'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Config.User}}' "$LOCAL_IMAGE")" = 636:636
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' "$LOCAL_IMAGE")" = '["/docker-entrypoint.sh"]'
+          # Every ELF file of the bundled runtime and of APISIX resolves its libraries.
+          docker run --rm -i --network none --user 0 --entrypoint bash "$LOCAL_IMAGE" -s <<'SH'
+          set -euo pipefail
+          count=0 missing=0
+          while IFS= read -r -d '' file; do
+            [ "$(head -c 4 "$file" | od -An -tx1 | tr -d ' \n')" = 7f454c46 ] || continue
+            count=$((count + 1))
+            if ldd "$file" 2>&1 | grep 'not found'; then
+              echo "Unresolved library in $file"
+              missing=1
+            fi
+          done < <(find /usr/local/openresty /usr/local/apisix -type f -print0)
+          test "$count" -gt 10
+          test "$missing" = 0
+          echo "PASS $count ELF files under /usr/local/openresty and /usr/local/apisix resolve every library"
+          SH
+          smoke_dir="$RUNNER_TEMP/apisix-smoke"
+          mkdir -p "$smoke_dir"
+          # Standalone data plane: routes come from apisix.yaml, no etcd, no Admin API.
+          cat > "$smoke_dir/config.yaml" <<'YAML'
+          deployment:
+            role: data_plane
+            role_data_plane:
+              config_provider: yaml
+          apisix:
+            node_listen: 9080
+            enable_admin: false
+          YAML
+          # /backend is a local dummy upstream (mocking plugin); /proxy forwards to it
+          # over a real upstream connection. Standalone mode reads apisix.yaml only
+          # up to its #END line.
+          cat > "$smoke_dir/apisix.yaml" <<'YAML'
+          routes:
+            - id: backend
+              uri: /backend
+              plugins:
+                mocking:
+                  content_type: text/plain
+                  response_status: 200
+                  response_example: apisix-smoke-ok
+            - id: proxy
+              uri: /proxy
+              upstream:
+                type: roundrobin
+                nodes:
+                  "127.0.0.1:9080": 1
+              plugins:
+                proxy-rewrite:
+                  uri: /backend
+          #END
+          YAML
+          chmod 755 "$smoke_dir"
+          chmod 644 "$smoke_dir"/*.yaml
+          trap 'docker rm -f ci-apisix >/dev/null 2>&1 || true' EXIT
+          # No network, host ports or credentials; non-root with all capabilities dropped.
+          docker run -d --name ci-apisix --network none --user 636:636 --cap-drop ALL \
+            --security-opt no-new-privileges -e APISIX_STAND_ALONE=true \
+            --mount "type=bind,src=$smoke_dir/config.yaml,dst=/usr/local/apisix/conf/config.yaml,readonly" \
+            --mount "type=bind,src=$smoke_dir/apisix.yaml,dst=/usr/local/apisix/conf/apisix.yaml,readonly" \
+            "$LOCAL_IMAGE" >/dev/null
+          for attempt in $(seq 1 30); do
+            if docker exec ci-apisix curl --max-time 5 -fsS http://127.0.0.1:9080/proxy >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          body="$(docker exec ci-apisix curl --max-time 5 -fsS http://127.0.0.1:9080/proxy)" || { docker logs ci-apisix; exit 1; }
+          test "$body" = apisix-smoke-ok
+          test "$(docker exec ci-apisix curl --max-time 5 -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9080/none)" = 404
+          test "$(docker exec ci-apisix sh -c 'stat -c %u /proc/[0-9]* 2>/dev/null' | sort -u)" = 636
+          docker exec ci-apisix /usr/bin/apisix version
+          if ! logs="$(docker logs ci-apisix 2>&1)"; then
+            echo '::error::docker logs failed for the APISIX container'
+            exit 1
+          fi
+          if grep -E '\[(emerg|alert|crit)\]' <<<"$logs"; then
+            echo '::error::APISIX logged an emerg, alert or crit message'
+            exit 1
+          fi
+          echo 'PASS standalone APISIX as uid 636 proxied one request to a local upstream'
       - &scanner
         name: Install checksum-pinned Trivy 0.76.1
         shell: bash
@@ -615,6 +702,7 @@ jobs:
       - *release_build_cache
       - *vllm_runtime
       - *postgres_runtime
+      - *apisix_runtime
       - *scanner
       - *scan
       - *identity
