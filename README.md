@@ -47,7 +47,6 @@ recipe's checks, scans it with Trivy and publishes it to
 |---|---|---|
 | `vllm` | vLLM 0.34.0 | Unmodified PyPI wheels, hash-locked, on Amazon Linux 2023 minimal; setuptools raised above vLLM's cap. |
 | `postgres` | `postgres:16.16-alpine3.24` | Upgrades three Alpine packages and replaces gosu with Alpine's su-exec; PostgreSQL files unchanged. |
-| `apisix` | Apache APISIX 3.21.0 | The official signed RPM, unchanged, on Amazon Linux 2023 minimal instead of UBI 9; its bundled OpenSSL 3.5.9 is outside the scan and has known CVEs without a released upstream fix (see the recipe header). |
 
 A recipe whose fresh scan fails is not republished and nothing is deleted; its
 published version stays as it was until the recipe is updated (see Upkeep).
