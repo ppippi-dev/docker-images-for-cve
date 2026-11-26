@@ -37,7 +37,7 @@
 # - Preserve upstream license notices; an image contains multiple licenses.
 # - Main publishes each image.version once as v<image.version>; a published
 #   version tag is never re-pointed. Raise the rN suffix of image.version
-#   (0.34.0-oss-r2 -> -r3) to publish a rebuild of the same vLLM version.
+#   (0.34.0-oss-r3 -> -r4) to publish a rebuild of the same vLLM version.
 #
 # CHANGES AGAINST THE UPSTREAM IMAGE (docker.io/vllm/vllm-openai, Ubuntu 24.04)
 # - Base: AL2023 minimal with python3.12, python3.12-devel and gcc only; no CUDA
@@ -56,6 +56,18 @@
 #   it (sentry-sdk and supervisor only as a Python < 3.8 fallback).
 # - No pip or uv (the OS keeps the ensurepip wheel python3.12-libs requires).
 #   Without ffmpeg, torchcodec video/audio decoding is unavailable.
+# - No precompiled bytecode (since -r3): the wheels are installed without
+#   --compile-bytecode and the __pycache__ folders of the OS Python are removed
+#   in the layer that installs them; the build fails if a __pycache__ folder is
+#   left under /opt/vllm or /usr/lib64/python3.12. -r2 held 30,087 files
+#   (0.55 GB) in such folders, of 102,074 files in total, so tools that list or
+#   hash every file of the image see each module once. No *.py file is changed
+#   or removed, and the 66 modules the OS Python ships as *.pyc only
+#   (encodings) stay. Python compiles a module at import and keeps the result
+#   under PYTHONPYCACHEPREFIX (/home/vllm/.cache/pycache) when that directory
+#   is writable; otherwise every start compiles again, which only lengthens
+#   the start. With another HOME or UID, point PYTHONPYCACHEPREFIX at a
+#   writable directory.
 # - User vllm (UID 2000, GID 0, HOME /home/vllm) as in upstream's
 #   vllm-openai-nonroot target; numeric USER for runAsNonRoot. Caches resolve
 #   under $HOME (.cache, .triton) and /tmp: with a read-only root filesystem
@@ -68,17 +80,17 @@
 #   paths.
 #
 # Build (linux/amd64 only; no local build context is sent; ~30 GB free disk):
-#   docker build --platform linux/amd64 -t vllm-cve:0.34.0-oss-r2 - < vllm/Dockerfile
+#   docker build --platform linux/amd64 -t vllm-cve:0.34.0-oss-r3 - < vllm/Dockerfile
 # Supplementary public scan (run outside this repository):
 #   trivy image --scanners vuln --ignorefile '' --ignore-unfixed=false \
 #     --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
-#     vllm-cve:0.34.0-oss-r2
+#     vllm-cve:0.34.0-oss-r3
 # Scan the exact image with your own scanner and policy before use.
 #
 # Baseline: public vllm/vllm-openai:v0.34.0-x86_64, Trivy 0.76.2, DB 2026-11-24:
 #   2,394 findings (2,387 OS, 7 Python); 727 with a fixed version, 1,667 without.
 # This recipe, same scanner and DB, 2026-11-25: 0 findings (140 RPMs, 211 Python
-#   packages); 4.5 GB compressed, 10.2 GB uncompressed.
+#   packages); 4.5 GB compressed, 10.2 GB uncompressed (-r2, with bytecode).
 #
 # Pins: images by digest; RPMs by version (AL2023 repositories are locked to the
 # base release); Python: the VLLM_LOCK heredoc (199 wheels, version + SHA-256)
@@ -125,6 +137,10 @@ dnf -y --releasever=2023.12.20261120 --setopt=install_weak_deps=0 --nodocs insta
     python3.12-devel-3.12.16-2.amzn2023.0.1 \
     gcc-11.5.0-5.amzn2023.0.5
 rpm -q python3.12-3.12.16-2.amzn2023.0.1 python3.12-devel-3.12.16-2.amzn2023.0.1 gcc-11.5.0-5.amzn2023.0.5
+# No precompiled bytecode in the image (see header): removed in the layer that
+# installs it, so no layer holds these files.
+find /usr/lib64/python3.12 -depth -type d -name __pycache__ -exec rm -rf {} +
+test -z "$(find /usr/lib64/python3.12 -name __pycache__ -print -quit)"
 dnf clean all
 rm -rf /var/cache/dnf /var/cache/yum /var/log/dnf* /var/log/hawkey.log
 SH
@@ -427,12 +443,12 @@ RUN --mount=from=uv,source=/uv,target=/run/uv \
     --mount=from=locked-requirements,source=/requirements.txt,target=/run/vllm-requirements.txt <<'SH'
 set -eu
 test "$TARGETARCH" = amd64
-export UV_PYTHON_DOWNLOADS=never UV_NO_CACHE=1
+export UV_PYTHON_DOWNLOADS=never UV_NO_CACHE=1 PYTHONDONTWRITEBYTECODE=1
 /run/uv --no-config venv --python /usr/bin/python3.12 /opt/vllm
 /run/uv --no-config pip install --python /opt/vllm/bin/python \
     --index-url https://pypi.org/simple --only-binary :all: --no-deps \
-    --require-hashes --compile-bytecode -r /run/vllm-requirements.txt
-/opt/vllm/bin/python -I - /run/vllm-requirements.txt <<'PY'
+    --require-hashes -r /run/vllm-requirements.txt
+/opt/vllm/bin/python -I -B - /run/vllm-requirements.txt <<'PY'
 import importlib.metadata as metadata
 import importlib.util
 import sys
@@ -463,10 +479,15 @@ assert installed['vllm'] == Version('0.34.0') and installed['setuptools'] >= Ver
 assert importlib.util.find_spec('pip') is None and not list(Path('/opt/vllm/bin').glob('pip*'))
 print(f'Verified {len(installed)} locked distributions; only vllm -> setuptools is overridden')
 PY
+# No precompiled bytecode (see header): uv installs without compiling and the
+# check above runs with -B. Whatever an interpreter still wrote during this RUN
+# is removed in the same layer; no wheel file other than *.pyc lives there.
+find /opt/vllm /usr/lib64/python3.12 -depth -type d -name __pycache__ -exec rm -rf {} +
+test -z "$(find /opt/vllm /usr/lib64/python3.12 -name __pycache__ -print -quit)"
 SH
 
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="0.34.0-oss-r2" \
+      org.opencontainers.image.version="0.34.0-oss-r3" \
       org.opencontainers.image.base.name="public.ecr.aws/amazonlinux/amazonlinux:2023.12.20261120.0-minimal" \
       org.opencontainers.image.base.digest="sha256:75a2d4226d9b98c914d7eed878a03bef4f365ad548be5d28d464ccba504cec79" \
       org.opencontainers.image.description="vLLM 0.34.0 OpenAI-compatible server rebuilt on Amazon Linux 2023 minimal from hash-locked PyPI wheels for linux/amd64; requires a fresh vulnerability scan before use"
@@ -476,6 +497,7 @@ ENV PATH="/opt/vllm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
     LD_LIBRARY_PATH="/usr/local/nvidia/lib64" \
     NVIDIA_VISIBLE_DEVICES="all" \
     NVIDIA_DRIVER_CAPABILITIES="compute,utility" \
+    PYTHONPYCACHEPREFIX="/home/vllm/.cache/pycache" \
     VLLM_NO_USAGE_STATS="1" \
     DO_NOT_TRACK="1"
 WORKDIR /vllm-workspace
