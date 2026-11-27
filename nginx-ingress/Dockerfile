@@ -24,7 +24,7 @@
 #   MPL-2.0 (hashicorp/go-version, hashicorp/golang-lru). As in the upstream
 #   image, their license texts are not in the image.
 # - Alpine packages keep their own licenses (including GPL/LGPL, e.g. busybox;
-#   libexpat is MIT; Alpine package sources:
+#   libexpat and libxml2 are MIT; Alpine package sources:
 #   https://gitlab.alpinelinux.org/alpine/aports).
 # A successful CVE scan or functional test does not establish license clearance.
 #
@@ -56,23 +56,37 @@
 # nginx, njs, the nginx modules and nginx-agent are nginx.org packages recorded
 # in the apk database under Alpine-like names: Trivy matches them against
 # Alpine advisories by name only, and it does not inventory the Go modules
-# inside nginx-agent. Follow the nginx security advisories
+# inside nginx-agent. Known finding that the scan of this image does not report:
+# nginx-agent 3.12.5 (go1.27.4) includes golang.org/x/crypto v0.58.0, which the
+# same scan of the 5.8.1-ubi variant reports in usr/bin/nginx-agent as
+# GO-2026-5932 (the x/crypto/openpgp package is unmaintained and unsafe;
+# severity UNKNOWN, no CVSS assessment, fixed in
+# 0.58.1-0.20261009181718-2f1f834330b2). If the scanner saw it, CI would block
+# it as a missing CVSS v3 assessment. The binary contains no x/crypto/openpgp
+# package strings, so that package does not appear to be compiled in; this was
+# not verified further. On every upstream tag, run go version -m on a copy of
+# /usr/bin/nginx-agent and compare its modules with the scan of the -ubi tag.
+# Follow the nginx security advisories
 # (https://nginx.org/en/security_advisories.html) and the kubernetes-ingress
 # releases (https://github.com/nginx/kubernetes-ingress/releases), and move to
 # the newest upstream tag when they list a fix.
 #
 # CHANGES AGAINST THE UPSTREAM IMAGE, and nothing else
-# - libexpat 2.10.0-r0 -> 2.11.0-r0 (Alpine v3.24 main, signed index), with
-#   "apk upgrade" so that /etc/apk/world gets no version pin. Only
-#   /usr/lib/libfontconfig.so.1 links it (image-filter -> libgd -> fontconfig).
+# - libexpat 2.10.0-r0 -> 2.11.0-r0 and libxml2 2.13.9-r3 -> 2.13.9-r5 (Alpine
+#   v3.24 main, signed index), with "apk upgrade" so that /etc/apk/world gets no
+#   version pins. Only /usr/lib/libfontconfig.so.1 links libexpat (image-filter
+#   -> libgd -> fontconfig). libxml2 is linked by the xslt and njs modules
+#   (ngx_http_xslt_filter, ngx_http_js, ngx_stream_js and their -debug
+#   builds), njs, libxslt, libexslt and xsltproc.
 # - /usr/share/licenses/nginx-ingress/LICENSE is added (see LICENSE NOTES).
-# - Layers are flattened, so the old libexpat is physically absent from every
-#   layer, not only hidden by a whiteout. File capabilities and ownership are kept.
+# - Layers are flattened, so the old libexpat and libxml2 are physically absent
+#   from every layer, not only hidden by a whiteout. File capabilities and
+#   ownership are kept.
 # - Config (ENV, ENTRYPOINT, USER, WORKDIR, EXPOSE, STOPSIGNAL) equals upstream;
 #   the upstream labels are replaced by the labels below. That drops the
 #   upstream licenses label (Apache-2.0), which names the controller's license
 #   only; LICENSE NOTES list the licenses of the image.
-# The build fails unless exactly this package changes, /etc/apk/world and the
+# The build fails unless exactly these packages change, /etc/apk/world and the
 # file capabilities of /nginx-ingress, nginx and nginx-debug are unchanged, and
 # every other entry keeps its upstream type, mode, owner, symlink target and,
 # for files, bytes.
@@ -92,15 +106,19 @@
 #
 # Baseline: upstream 5.8.1-alpine, platform manifest
 #   sha256:26a6ed01de687f4a2a8b9991632d40d72dde114dc54bc00a185e2ee7ec1e2380
-#   (Trivy 0.76.2, DB 2026-11-26): 3 findings, all in Alpine libexpat 2.10.0-r0
-#   with the fixed version 2.11.0-r0. The 5.8.1-ubi variant has 1 finding in a Go
-#   module and the Debian variant hundreds. 5.8.1 is the newest release.
+#   (Trivy 0.76.2, DB 2026-11-27): 15 findings, all in Alpine packages with a
+#   fixed version: 3 in libexpat 2.10.0-r0 (fixed in 2.11.0-r0) and 12 in libxml2
+#   2.13.9-r3 (fixed in 2.13.9-r4 and 2.13.9-r5). The 5.8.1-ubi variant has 1
+#   finding, GO-2026-5932 in the Go module golang.org/x/crypto v0.58.0 of
+#   nginx-agent; this Alpine image (upstream and rebuilt) carries the same
+#   module, but the scan does not report it (see SCAN SCOPE). The Debian variant
+#   has 379. 5.8.1 is the newest release.
 #
 # UPKEEP (a new upstream tag, a new Alpine package release, or a new finding)
 # The Alpine index keeps only the newest release of a package, so the
-# package-list check fails as soon as Alpine publishes a newer libexpat. A pull
-# request that changes the workflow builds every recipe, so it fails on this
-# recipe too until the recipe is updated; then:
+# package-list check fails as soon as Alpine publishes a newer libexpat or
+# libxml2. A pull request that changes the workflow builds every recipe, so it
+# fails on this recipe too until the recipe is updated; then:
 # 1. Upstream: find the newest kubernetes-ingress release and the index digest
 #    of its -alpine tag with docker buildx imagetools inspect
 #    public.ecr.aws/nginx/nginx-ingress:<version>-alpine. Scan it as is (command
@@ -143,7 +161,7 @@ entries() {
 snapshot() {
   { entries | xargs -0 stat -c '%n|%F|%f|%u:%g|%N'
     entries -type f | xargs -0 sha256sum | sed 's/^\([0-9a-f]*\)  \(.*\)$/\2|sha256:\1/'
-  } | grep -v -e '^/usr/lib/libexpat\.so' -e '^/var/log/apk\.log|' | sort
+  } | grep -v -e '^/usr/lib/libexpat\.so' -e '^/usr/lib/libxml2\.so' -e '^/var/log/apk\.log|' | sort
 }
 snapshot > /tmp/files-before
 grep -qx '/nginx-ingress|regular file|81fd|101:0|/nginx-ingress' /tmp/files-before
@@ -151,15 +169,17 @@ grep -q '^/nginx\.tmpl|sha256:' /tmp/files-before
 
 # "upgrade" keeps /etc/apk/world free of version pins; the exact versions are
 # enforced by the package-list check below, which fails when the index moves.
-apk upgrade --no-cache libexpat
+apk upgrade --no-cache libexpat libxml2
 
-# Only the intended package changed.
+# Only the intended packages changed.
 apk info -v | sort > /tmp/apk-after
 { comm -23 /tmp/apk-before /tmp/apk-after | sed 's/^/- /'
   comm -13 /tmp/apk-before /tmp/apk-after | sed 's/^/+ /'; } > /tmp/apk-diff
 cat > /tmp/apk-expected <<'EOF'
 - libexpat-2.10.0-r0
+- libxml2-2.13.9-r3
 + libexpat-2.11.0-r0
++ libxml2-2.13.9-r5
 EOF
 diff /tmp/apk-expected /tmp/apk-diff
 diff /tmp/apk-world-before /etc/apk/world
@@ -183,7 +203,7 @@ LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-imag
       org.opencontainers.image.version="5.8.1-alpine-r1" \
       org.opencontainers.image.base.name="public.ecr.aws/nginx/nginx-ingress:5.8.1-alpine" \
       org.opencontainers.image.base.digest="sha256:3396b325971fd36202dfb2e0dca73950d23d27f570ab5ed232d3540799ad6ff7" \
-      org.opencontainers.image.description="F5 NGINX Ingress Controller 5.8.1 Alpine image with a patched Alpine libexpat; requires a fresh vulnerability scan before use"
+      org.opencontainers.image.description="F5 NGINX Ingress Controller 5.8.1 Alpine image with patched Alpine libexpat and libxml2; requires a fresh vulnerability scan before use"
 WORKDIR /
 EXPOSE 80 443
 STOPSIGNAL SIGTERM
