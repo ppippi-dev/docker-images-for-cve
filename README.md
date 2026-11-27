@@ -61,7 +61,7 @@ published version stays as it was until the recipe is updated (see Upkeep).
    against the upstream image, build and scan commands, baseline findings and
    UPKEEP steps.
 3. Set `org.opencontainers.image.version` to `<upstream>-<variant>-rN`, for
-   example `16.16-alpine3.24-r1`. Start at `r1` for a new upstream version and
+   example `16.16-alpine3.24-r2`. Start at `r1` for a new upstream version and
    raise `rN` to publish a rebuild of the same one. Never go back to an earlier
    label: its version was deleted, so it would be published again with other
    contents.

@@ -32,7 +32,7 @@
 #   No runtime/compiler exceptions: every component must satisfy CVSS v3 = 0.
 #   Any v3 score > 0, unknown/malformed assessment, or scanner error blocks.
 # - Preserve upstream license notices; an image contains multiple licenses.
-# - image.version is <upstream>-<variant>-rN (16.16-alpine3.24-r1). Main
+# - image.version is <upstream>-<variant>-rN (16.16-alpine3.24-r2). Main
 #   publishes each image.version once as v<image.version>; a published version
 #   tag is never re-pointed. Raise rN (-r1 -> -r2) to publish a rebuild of the
 #   same upstream image; start again at -r1 for a new upstream tag.
@@ -46,7 +46,7 @@
 #
 # CHANGES AGAINST THE UPSTREAM IMAGE, and nothing else
 # - libcrypto3 3.5.9-r0 -> 3.5.9-r1, libssl3 3.5.9-r0 -> 3.5.9-r1,
-#   libxml2 2.13.9-r2 -> 2.13.9-r3 (Alpine v3.24 main, signed index), with
+#   libxml2 2.13.9-r2 -> 2.13.9-r5 (Alpine v3.24 main, signed index), with
 #   "apk upgrade" so that /etc/apk/world gets no version pins.
 # - gosu is removed. Alpine's su-exec 0.3-r0 is added, and /usr/local/bin/gosu
 #   and /usr/local/bin/su-exec point to it, so the unchanged entrypoint can
@@ -63,22 +63,23 @@
 # pg_config --configure equals upstream.
 #
 # Build (linux/amd64 only; no local build context is sent):
-#   docker build --platform linux/amd64 -t postgres-cve:16.16-alpine3.24-r1 - < postgres/Dockerfile
+#   docker build --platform linux/amd64 -t postgres-cve:16.16-alpine3.24-r2 - < postgres/Dockerfile
 # Supplementary public scan (run outside this repository):
 #   trivy image --scanners vuln --ignorefile '' --ignore-unfixed=false \
 #     --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
-#     postgres-cve:16.16-alpine3.24-r1
+#     postgres-cve:16.16-alpine3.24-r2
 # CI also starts the server as uid 70 with a read-only root and as root, restarts
 # it on the same volume and connects from a second container with a password.
 #
 # Baseline: upstream 16.16-alpine3.24, platform manifest
 #   sha256:9d9e487c1bd6413c52ccb3c02f46c8e37fa1e1d1a32a84519eb4e68d0ad1da30
-#   (Trivy 0.76.1, DB 2026-11-25): 72 findings, all with a fixed version.
+#   (Trivy 0.76.2, DB 2026-11-27): 84 findings, all with a fixed version.
 #   - 61 in /usr/local/bin/gosu 1.20: it is built with Go 1.24.6 and
 #     golang.org/x/sys v0.1.0 on purpose (upstream does not rebuild gosu for
 #     stdlib CVEs). The 16.16 bookworm/trixie/alpine3.23 variants carry the same
 #     gosu, and Debian variants add hundreds of OS findings.
-#   - 11 in Alpine 3.24 packages: libcrypto3/libssl3 3.5.9-r0, libxml2 2.13.9-r2.
+#   - 23 in Alpine 3.24 packages: libcrypto3/libssl3 3.5.9-r0 (10, fixed in
+#     3.5.9-r1) and libxml2 2.13.9-r2 (13, fixed in 2.13.9-r3, -r4 and -r5).
 #
 # UPKEEP (a new upstream 16.x tag, a new Alpine package release, or a new finding)
 # The Alpine index keeps only the newest release of a package, so the
@@ -137,7 +138,7 @@ cat > /tmp/apk-expected <<'EOF'
 - libxml2-2.13.9-r2
 + libcrypto3-3.5.9-r1
 + libssl3-3.5.9-r1
-+ libxml2-2.13.9-r3
++ libxml2-2.13.9-r5
 + su-exec-0.3-r0
 EOF
 diff /tmp/apk-expected /tmp/apk-diff
@@ -171,7 +172,7 @@ ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     DOCKER_PG_LLVM_DEPS="llvm21-dev 		clang21" \
     PGDATA="/var/lib/postgresql/data"
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="16.16-alpine3.24-r1" \
+      org.opencontainers.image.version="16.16-alpine3.24-r2" \
       org.opencontainers.image.base.name="docker.io/library/postgres:16.16-alpine3.24" \
       org.opencontainers.image.base.digest="sha256:f2f98726820d0342055351c6e9d36e705f5bfffb3dd53ff556325114b08afb6d" \
       org.opencontainers.image.description="Official PostgreSQL 16.16 Alpine image with patched Alpine packages and su-exec in place of gosu; requires a fresh vulnerability scan before use"
