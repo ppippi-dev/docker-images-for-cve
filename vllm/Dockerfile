@@ -18,6 +18,15 @@
 #   NVSHMEM and the CUTLASS DSL native libraries. Most are under NVIDIA license
 #   agreements; some are Apache-2.0, MIT or BSD. cuda-toolkit is a metapackage
 #   without its own license file.
+# - FFmpeg 8.1.1 shared libraries (LGPL-2.1-or-later) inside the PyNvVideoCodec
+#   wheel, built by NVIDIA with the configure options listed in
+#   /opt/vllm/external/ffmpeg/readme.txt, and FFmpeg libraries inside
+#   opencv-python-headless. The PyNvVideoCodec wheel ships the corresponding
+#   source as external/ffmpeg/src/ffmpeg-8.1.1.tar.xz; the image does not keep
+#   that archive (since -r4). It is byte for byte the release archive
+#     https://ffmpeg.org/releases/ffmpeg-8.1.1.tar.xz
+#     sha256 b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3
+#   and stays inside the wheel pynvvideocodec==2.0.4 on PyPI.
 # Every dist-info license file and /usr/share/licenses are kept in the image;
 # see each component's license text for its terms.
 #
@@ -37,7 +46,7 @@
 # - Preserve upstream license notices; an image contains multiple licenses.
 # - Main publishes each image.version once as v<image.version>; a published
 #   version tag is never re-pointed. Raise the rN suffix of image.version
-#   (0.34.0-oss-r3 -> -r4) to publish a rebuild of the same vLLM version.
+#   (0.34.0-oss-r4 -> -r5) to publish a rebuild of the same vLLM version.
 #
 # CHANGES AGAINST THE UPSTREAM IMAGE (docker.io/vllm/vllm-openai, Ubuntu 24.04)
 # - Base: AL2023 minimal with python3.12, python3.12-devel and gcc only; no CUDA
@@ -54,7 +63,9 @@
 #   https://github.com/pypa/setuptools/security/advisories/GHSA-xmj3-9gf7-h52w
 #   setuptools >= 81 has no pkg_resources; vLLM, torch and Triton do not import
 #   it (sentry-sdk and supervisor only as a Python < 3.8 fallback).
-# - No pip or uv (the OS keeps the ensurepip wheel python3.12-libs requires).
+# - No pip or uv. The pip wheel that python3.12-libs brings for ensurepip
+#   (/usr/share/python3.12-wheels) is removed as well (since -r4), so ensurepip
+#   and `python -m venv` with pip do not work in the image.
 #   Without ffmpeg, torchcodec video/audio decoding is unavailable.
 # - No precompiled bytecode (since -r3): the wheels are installed without
 #   --compile-bytecode and the __pycache__ folders of the OS Python are removed
@@ -68,6 +79,11 @@
 #   is writable; otherwise every start compiles again, which only lengthens
 #   the start. With another HOME or UID, point PYTHONPYCACHEPREFIX at a
 #   writable directory.
+# - Two files that nothing reads at run time are left out (since -r4), because
+#   tools that identify components by file content attribute their known
+#   vulnerabilities to the image: the FFmpeg source archive of the
+#   PyNvVideoCodec wheel (see LICENSE NOTES; no code of the wheel refers to
+#   it) and the pip wheel above. The build fails if either is still there.
 # - User vllm (UID 2000, GID 0, HOME /home/vllm) as in upstream's
 #   vllm-openai-nonroot target; numeric USER for runAsNonRoot. Caches resolve
 #   under $HOME (.cache, .triton) and /tmp: with a read-only root filesystem
@@ -80,11 +96,11 @@
 #   paths.
 #
 # Build (linux/amd64 only; no local build context is sent; ~30 GB free disk):
-#   docker build --platform linux/amd64 -t vllm-cve:0.34.0-oss-r3 - < vllm/Dockerfile
+#   docker build --platform linux/amd64 -t vllm-cve:0.34.0-oss-r4 - < vllm/Dockerfile
 # Supplementary public scan (run outside this repository):
 #   trivy image --scanners vuln --ignorefile '' --ignore-unfixed=false \
 #     --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
-#     vllm-cve:0.34.0-oss-r3
+#     vllm-cve:0.34.0-oss-r4
 # Scan the exact image with your own scanner and policy before use.
 #
 # Baseline: public vllm/vllm-openai:v0.34.0-x86_64, Trivy 0.76.2, DB 2026-11-24:
@@ -141,6 +157,10 @@ rpm -q python3.12-3.12.16-2.amzn2023.0.1 python3.12-devel-3.12.16-2.amzn2023.0.1
 # installs it, so no layer holds these files.
 find /usr/lib64/python3.12 -depth -type d -name __pycache__ -exec rm -rf {} +
 test -z "$(find /usr/lib64/python3.12 -name __pycache__ -print -quit)"
+# The pip wheel for ensurepip is not used (see header): removed in the layer
+# that installs it.
+rm -f /usr/share/python3.12-wheels/pip-*.whl
+test -z "$(find /usr -xdev -name 'pip-*.whl' -print -quit)"
 dnf clean all
 rm -rf /var/cache/dnf /var/cache/yum /var/log/dnf* /var/log/hawkey.log
 SH
@@ -479,6 +499,13 @@ assert installed['vllm'] == Version('0.34.0') and installed['setuptools'] >= Ver
 assert importlib.util.find_spec('pip') is None and not list(Path('/opt/vllm/bin').glob('pip*'))
 print(f'Verified {len(installed)} locked distributions; only vllm -> setuptools is overridden')
 PY
+# The FFmpeg source archive of the PyNvVideoCodec wheel is not kept (see
+# header); its readme with the build options stays.
+test -f /opt/vllm/external/ffmpeg/src/ffmpeg-8.1.1.tar.xz
+rm -f /opt/vllm/external/ffmpeg/src/ffmpeg-8.1.1.tar.xz
+rmdir /opt/vllm/external/ffmpeg/src
+test -f /opt/vllm/external/ffmpeg/readme.txt
+test -z "$(find /opt/vllm -xdev \( -name '*.tar.xz' -o -name '*.tar.gz' -o -name '*.tgz' -o -name 'pip-*.whl' \) -print -quit)"
 # No precompiled bytecode (see header): uv installs without compiling and the
 # check above runs with -B. Whatever an interpreter still wrote during this RUN
 # is removed in the same layer; no wheel file other than *.pyc lives there.
@@ -487,7 +514,7 @@ test -z "$(find /opt/vllm /usr/lib64/python3.12 -name __pycache__ -print -quit)"
 SH
 
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="0.34.0-oss-r3" \
+      org.opencontainers.image.version="0.34.0-oss-r4" \
       org.opencontainers.image.base.name="public.ecr.aws/amazonlinux/amazonlinux:2023.12.20261120.0-minimal" \
       org.opencontainers.image.base.digest="sha256:75a2d4226d9b98c914d7eed878a03bef4f365ad548be5d28d464ccba504cec79" \
       org.opencontainers.image.description="vLLM 0.34.0 OpenAI-compatible server rebuilt on Amazon Linux 2023 minimal from hash-locked PyPI wheels for linux/amd64; requires a fresh vulnerability scan before use"
