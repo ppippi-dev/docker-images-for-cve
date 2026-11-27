@@ -46,7 +46,7 @@
 # - Preserve upstream license notices; an image contains multiple licenses.
 # - Main publishes each image.version once as v<image.version>; a published
 #   version tag is never re-pointed. Raise the rN suffix of image.version
-#   (0.34.0-oss-r4 -> -r5) to publish a rebuild of the same vLLM version.
+#   (0.34.0-oss-r5 -> -r6) to publish a rebuild of the same vLLM version.
 #
 # CHANGES AGAINST THE UPSTREAM IMAGE (docker.io/vllm/vllm-openai, Ubuntu 24.04)
 # - Base: AL2023 minimal with python3.12, python3.12-devel and gcc only; no CUDA
@@ -56,13 +56,43 @@
 # - gcc and Python.h stay: Triton compiles its CUDA launcher
 #   (triton/backends/nvidia/driver.c) with $CC, gcc or clang at first kernel use
 #   (triton/runtime/build.py) and loads it from its cache under $HOME.
-# - Python set = the PyPI resolution of vllm==0.34.0 except setuptools: vLLM declares
-#   setuptools<81, whose newest release 80.10.2 has CVE-2026-59890 (fixed in
-#   83.0.0) and GHSA-xmj3-9gf7-h52w (fixed in 84.1.0); 84.2.1 is installed.
-#   https://github.com/pypa/setuptools/security/advisories/GHSA-h35f-9h28-mq5c
-#   https://github.com/pypa/setuptools/security/advisories/GHSA-xmj3-9gf7-h52w
-#   setuptools >= 81 has no pkg_resources; vLLM, torch and Triton do not import
-#   it (sentry-sdk and supervisor only as a Python < 3.8 fallback).
+# - Python set = the PyPI resolution of vllm==0.34.0 except two packages whose
+#   fixed releases vLLM does not allow. Both are overrides in the lock stage, so
+#   regenerating the lock reproduces them:
+#   - setuptools: vLLM declares setuptools<81, whose newest release 80.10.2
+#     has CVE-2026-59890 (fixed in 83.0.0) and GHSA-xmj3-9gf7-h52w (fixed in
+#     84.1.0); 84.2.1 is installed.
+#     https://github.com/pypa/setuptools/security/advisories/GHSA-h35f-9h28-mq5c
+#     https://github.com/pypa/setuptools/security/advisories/GHSA-xmj3-9gf7-h52w
+#     setuptools >= 81 has no pkg_resources; vLLM, torch and Triton do not
+#     import it (sentry-sdk and supervisor only as a Python < 3.8 fallback).
+#   - tilelang (since -r5): vLLM pins tilelang==0.1.12 (requirements/cuda.txt),
+#     whose tilelang/cache/kernel_cache.py loads params.pkl of the on-disk
+#     kernel cache with cloudpickle (CVE-2026-87083). 0.1.15 stores these
+#     params as JSON and is installed.
+#     https://github.com/tile-ai/tilelang/pull/3143
+#     Its declared dependencies equal those of 0.1.12 except
+#     apache-tvm-ffi>=0.1.11,<0.1.13, which the locked 0.1.11 (vLLM's pin)
+#     satisfies; no other package of the lock changes. tilelang's autotuner
+#     cache (tilelang/autotuner/param.py) still loads a pickled function;
+#     vLLM does not use the autotuner.
+#     vLLM imports tilelang in two places. Its mHC kernels (DeepSeek-V4,
+#     DeepSeek-V4.1 and GLM-5-Next type models: vllm/tilelang_utils,
+#     vllm/model_executor/kernels/mhc) are TileLang kernels. And every CUDA
+#     worker, for every model, imports tilelang.jit after warm-up and wraps
+#     JITKernel.__init__ and JITImpl.compile to log runtime compilations
+#     (vllm/utils/jit_monitor.py, whenever kernel_config.enable_jit_warmup is
+#     on, the default); a failed import is skipped. So a GPU start of any model
+#     imports tilelang 0.1.15.
+#     Checked without a GPU (not a CI step): tilelang 0.1.15 imports,
+#     vllm.tilelang_utils and the mHC kernel modules import, tilelang.jit
+#     accepts vLLM's pass configs, the T.* functions, PassConfigKey members
+#     and JIT attributes (compile, func.parse_args, _kernel_cache) that vLLM
+#     uses exist, and the JIT monitor's hook installs: JITKernel.__init__
+#     keeps from_database at position 7, where the hook reads it.
+#     NOT VERIFIED: any GPU start with 0.1.15, and compiling or running the
+#     mHC kernels on a GPU (see Runtime JIT gap); run a GPU model test before
+#     use, and one of the models above before serving it.
 # - No pip or uv. The pip wheel that python3.12-libs brings for ensurepip
 #   (/usr/share/python3.12-wheels) is removed as well (since -r4), so ensurepip
 #   and `python -m venv` with pip do not work in the image.
@@ -84,6 +114,25 @@
 #   vulnerabilities to the image: the FFmpeg source archive of the
 #   PyNvVideoCodec wheel (see LICENSE NOTES; no code of the wheel refers to
 #   it) and the pip wheel above. The build fails if either is still there.
+# - VLLM_USE_AOT_COMPILE=0 (since -r5). With torch >= 2.10, vLLM 0.34.0
+#   defaults it to 1 unless VLLM_DISABLE_COMPILE_CACHE is set (vllm/envs.py):
+#   vLLM then saves the compiled model function under VLLM_CACHE_ROOT
+#   (torch_compile_cache/torch_aot_compile/<hash>/rank_<r>_<dp>/model) and,
+#   when a container starts again with that cache, reads it back with
+#   torch.compiler.load_compiled_function (vllm/compilation/decorators.py, the
+#   only call site in vLLM). In torch 2.14.0, which vLLM pins, that function
+#   is an unrestricted pickle load (CVE-2026-136428). With 0, vLLM compiles
+#   the model with torch.compile at start and neither writes nor reads that
+#   file; VLLM_USE_MEGA_AOT_ARTIFACT, whose default follows it, is off too.
+#   Cost: Dynamo traces the model again whenever a container starts; vLLM's
+#   other compile caches (Inductor and Triton) are unchanged. To switch it
+#   back on, run the container with VLLM_USE_AOT_COMPILE=1.
+#   The setting removes only the load_compiled_function call. vLLM still
+#   saves its Inductor graphs under VLLM_CACHE_ROOT
+#   (torch_compile_cache/<hash>/rank_<r>_<dp>/<prefix>) and loads them at the
+#   next start with torch._inductor.CompiledArtifact.load, which unpickles as
+#   well (vllm/compilation/compiler_interface.py). Only the container may
+#   write to VLLM_CACHE_ROOT (default $HOME/.cache/vllm).
 # - User vllm (UID 2000, GID 0, HOME /home/vllm) as in upstream's
 #   vllm-openai-nonroot target; numeric USER for runAsNonRoot. Caches resolve
 #   under $HOME (.cache, .triton) and /tmp: with a read-only root filesystem
@@ -96,22 +145,23 @@
 #   paths.
 #
 # Build (linux/amd64 only; no local build context is sent; ~30 GB free disk):
-#   docker build --platform linux/amd64 -t vllm-cve:0.34.0-oss-r4 - < vllm/Dockerfile
+#   docker build --platform linux/amd64 -t vllm-cve:0.34.0-oss-r5 - < vllm/Dockerfile
 # Supplementary public scan (run outside this repository):
 #   trivy image --scanners vuln --ignorefile '' --ignore-unfixed=false \
 #     --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --exit-code 1 \
-#     vllm-cve:0.34.0-oss-r4
+#     vllm-cve:0.34.0-oss-r5
 # Scan the exact image with your own scanner and policy before use.
 #
 # Baseline: public vllm/vllm-openai:v0.34.0-x86_64, Trivy 0.76.2, DB 2026-11-24:
 #   2,394 findings (2,387 OS, 7 Python); 727 with a fixed version, 1,667 without.
-# This recipe, same scanner and DB, 2026-11-25: 0 findings (140 RPMs, 211 Python
-#   packages); 4.5 GB compressed, 10.2 GB uncompressed (-r2, with bytecode).
+# This recipe (-r5), Trivy 0.76.2, DB 2026-11-27: 0 findings (140 RPMs, 211
+#   Python packages); 9.6 GB uncompressed.
 #
 # Pins: images by digest; RPMs by version (AL2023 repositories are locked to the
 # base release); Python: the VLLM_LOCK heredoc (199 wheels, version + SHA-256)
 # installed with --require-hashes --no-deps. The build fails if the installed set
-# differs from the lock or a dependency other than vllm -> setuptools is unmet.
+# differs from the lock or a dependency other than vllm -> setuptools and
+# vllm -> tilelang is unmet.
 # Regenerate the lock (inputs and the exclude-newer cut-off are in the lock stage):
 #   docker build --platform linux/amd64 --target lock-export \
 #     --output type=local,dest=vllm-lock - < vllm/Dockerfile
@@ -126,9 +176,13 @@
 # the nvidia-cuda-nvcc wheel), there is no C++ compiler and no flashinfer-cubin
 # (no release matching flashinfer-python 0.7.3 on PyPI), so vLLM logs
 # "FlashInfer kernels are disabled" and FlashInfer JIT/cubin and DeepGEMM JIT
-# paths are unavailable; vLLM falls back where it can. A GPU test must confirm
-# the attention, sampler and MoE/FP8 backends in use. Adding gcc-c++ and
-# CUDA_HOME would need a new scan.
+# paths are unavailable; vLLM falls back where it can. TileLang builds the mHC
+# kernels with the wheel's nvcc as C++20 and passes g++, clang++ or c++ as its
+# host compiler (tilelang/contrib/nvcc.py, tilelang/contrib/cc.py), so they
+# most likely do not compile here (static judgement; vLLM's pinned 0.1.12
+# builds them the same way). A GPU
+# test must confirm the attention, sampler and MoE/FP8 backends in use.
+# Adding gcc-c++ and CUDA_HOME would need a new scan.
 #
 # Upkeep per vLLM release:
 # 1. Set the version in requirements.in, the lock header, the checks and labels
@@ -136,8 +190,12 @@
 #    version, since a published version tag is never re-pointed).
 # 2. Use the newest dated -minimal tag and index digest of
 #    public.ecr.aws/amazonlinux/amazonlinux; update --releasever and the RPMs.
-# 3. Re-check vLLM's setuptools bound (requirements/common.txt); drop the
-#    override and its exception in the check once a fixed release is allowed.
+# 3. Re-check vLLM's setuptools bound (requirements/common.txt) and tilelang
+#    pin (requirements/cuda.txt); drop an override, its exception in the check
+#    and its version assert once vLLM allows a fixed release. Keep
+#    VLLM_USE_AOT_COMPILE=0 while torch.compiler.load_compiled_function
+#    unpickles without restriction, and re-check that vllm/envs.py still reads
+#    it and that compilation/decorators.py is its only caller.
 # 4. Bump uv and the lock-stage packaging pin when convenient.
 # 5. Move exclude-newer, regenerate the lock, build, scan, then test on a GPU.
 
@@ -177,6 +235,8 @@ REQ
 cat > /tmp/lock-input/overrides.txt <<'REQ'
 # vLLM 0.34.0 declares setuptools<81; the fixed releases are above that cap.
 setuptools>=84.2.1
+# vLLM 0.34.0 pins tilelang==0.1.12; 0.1.15 no longer unpickles its kernel cache.
+tilelang==0.1.15
 REQ
 cat > /tmp/lock-input/tools.txt <<'REQ'
 packaging==26.4 --hash=sha256:81383611a09c1bc0b08b76e0fd5829d7c6824c65b27a6aee339da133f4233ea2
@@ -223,11 +283,13 @@ for line in open(source).read().replace('\\\n', ' ').splitlines():
         raise SystemExit('No consistent linux x86_64 CPython 3.12 wheel for ' + name)
     rows.append(f'{name}=={version} ' + ' '.join('--hash=sha256:' + h for h in keep))
 names = [row.split('==', 1)[0] for row in rows]
-assert 'vllm==0.34.0' in {row.split(' ', 1)[0] for row in rows} and len(set(names)) == len(names)
+pins = {row.split(' ', 1)[0] for row in rows}
+assert {'vllm==0.34.0', 'tilelang==0.1.15'} <= pins and len(set(names)) == len(names)
 with open(target, 'w') as output:
     output.write('# vLLM 0.34.0 for CPython 3.12 on linux x86_64 (glibc 2.34), PyPI wheels only.\n'
                  '# Generated by the lock stage of vllm/Dockerfile (uv 0.13.10,\n'
-                 '# exclude-newer 2026-11-25T05:00:00Z, override setuptools>=84.2.1).\n')
+                 '# exclude-newer 2026-11-25T05:00:00Z, overrides setuptools>=84.2.1\n'
+                 '# and tilelang==0.1.15).\n')
     output.write('\n'.join(rows) + '\n')
 print(f'{len(rows)} packages, {sum(row.count("--hash") for row in rows)} hashes')
 PY
@@ -240,7 +302,8 @@ FROM scratch AS locked-requirements
 COPY <<'VLLM_LOCK' /requirements.txt
 # vLLM 0.34.0 for CPython 3.12 on linux x86_64 (glibc 2.34), PyPI wheels only.
 # Generated by the lock stage of vllm/Dockerfile (uv 0.13.10,
-# exclude-newer 2026-11-25T05:00:00Z, override setuptools>=84.2.1).
+# exclude-newer 2026-11-25T05:00:00Z, overrides setuptools>=84.2.1
+# and tilelang==0.1.15).
 agent-detector==2.0.0 --hash=sha256:22c6a1c9c23894a12f55aea625f060b8d3330fba774de72d02d5442bb580417f
 aiohappyeyeballs==2.7.1 --hash=sha256:9243213661e29250eb41368e5daa826fc017156c3b8a11440826b2e3ed376472
 aiohttp==3.14.5 --hash=sha256:20f085697d7e911f1f73c43ed03fafbed1e7121797e2eb5428efa80398060584 --hash=sha256:efc21a454892828368b11c2c780de0ff8bc991f73f6b99c6b66e56205470929b
@@ -415,7 +478,7 @@ supervisor==4.3.0 --hash=sha256:0bcb763fddafba410f35cbde226aa7f8514b9fb82eb05a0c
 sympy==1.14.0 --hash=sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5
 tabulate==0.10.0 --hash=sha256:f0b0622e567335c8fabaaa659f1b33bcb6ddfe2e496071b743aa113f8774f2d3
 tiktoken==0.14.0 --hash=sha256:7896eea257fe497a2b7134474d909156c6744ce8da35bce88011a960e008aa0d
-tilelang==0.1.12 --hash=sha256:bbeb5573cbe2544a51a5c9a6cc737c5e3b5c2d95411caa3687fd9b08eb9d5f97
+tilelang==0.1.15 --hash=sha256:ca021a3450ad84b8fe7deb1b659c8d3d2e4b0855fdb59e2992a5349acf019881
 tokenizers==0.23.3 --hash=sha256:376851d22bcf9d650a5c3090bb83e6cf9e895fbf0595369fa4cd43c1f69b5f87
 tokenspeed-mla==2.0.3 --hash=sha256:576ce91e861598347f09c429fe41269863d351bf3de8410a845dae39fa172e4a
 tokenspeed-triton==3.9.10.post20261028 --hash=sha256:67f520af474d3e8afce38155c73b2b9a42864100ee220e2ee775f8706f1c5cc9
@@ -484,7 +547,8 @@ for line in Path(sys.argv[1]).read_text().splitlines():
 installed = {canonicalize_name(d.metadata['Name']): Version(d.version) for d in metadata.distributions()}
 assert installed == locked, 'Installed distributions differ from the lock'
 # --no-deps is safe only if the lock satisfies every declared dependency. The
-# one intended exception is vLLM's setuptools<81 cap (see header).
+# intended exceptions are vLLM's setuptools<81 cap and its tilelang==0.1.12
+# pin (see header).
 violations = set()
 for dist in metadata.distributions():
     for text in dist.requires or []:
@@ -494,10 +558,11 @@ for dist in metadata.distributions():
         dependency = canonicalize_name(requirement.name)
         if dependency not in installed or not requirement.specifier.contains(installed[dependency], prereleases=True):
             violations.add((canonicalize_name(dist.metadata['Name']), dependency))
-assert violations == {('vllm', 'setuptools')}, sorted(violations)
+assert violations == {('vllm', 'setuptools'), ('vllm', 'tilelang')}, sorted(violations)
 assert installed['vllm'] == Version('0.34.0') and installed['setuptools'] >= Version('84.2.1')
+assert installed['tilelang'] == Version('0.1.15')
 assert importlib.util.find_spec('pip') is None and not list(Path('/opt/vllm/bin').glob('pip*'))
-print(f'Verified {len(installed)} locked distributions; only vllm -> setuptools is overridden')
+print(f'Verified {len(installed)} locked distributions; only vllm -> setuptools and vllm -> tilelang are overridden')
 PY
 # The FFmpeg source archive of the PyNvVideoCodec wheel is not kept (see
 # header); its readme with the build options stays.
@@ -514,7 +579,7 @@ test -z "$(find /opt/vllm /usr/lib64/python3.12 -name __pycache__ -print -quit)"
 SH
 
 LABEL org.opencontainers.image.source="https://github.com/ppippi-dev/docker-images-for-cve" \
-      org.opencontainers.image.version="0.34.0-oss-r4" \
+      org.opencontainers.image.version="0.34.0-oss-r5" \
       org.opencontainers.image.base.name="public.ecr.aws/amazonlinux/amazonlinux:2023.12.20261120.0-minimal" \
       org.opencontainers.image.base.digest="sha256:75a2d4226d9b98c914d7eed878a03bef4f365ad548be5d28d464ccba504cec79" \
       org.opencontainers.image.description="vLLM 0.34.0 OpenAI-compatible server rebuilt on Amazon Linux 2023 minimal from hash-locked PyPI wheels for linux/amd64; requires a fresh vulnerability scan before use"
@@ -526,6 +591,7 @@ ENV PATH="/opt/vllm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
     NVIDIA_DRIVER_CAPABILITIES="compute,utility" \
     PYTHONPYCACHEPREFIX="/home/vllm/.cache/pycache" \
     VLLM_NO_USAGE_STATS="1" \
+    VLLM_USE_AOT_COMPILE="0" \
     DO_NOT_TRACK="1"
 WORKDIR /vllm-workspace
 USER 2000:0

@@ -45,7 +45,7 @@ recipe's checks, scans it with Trivy and publishes it to
 
 | Name | Upstream | What the recipe changes |
 |---|---|---|
-| `vllm` | vLLM 0.34.0 | Unmodified PyPI wheels, hash-locked, on Amazon Linux 2023 minimal; setuptools raised above vLLM's cap. |
+| `vllm` | vLLM 0.34.0 | Unmodified PyPI wheels, hash-locked, on Amazon Linux 2023 minimal; setuptools raised above vLLM's cap and tilelang above its exact pin; `VLLM_USE_AOT_COMPILE=0` by default. |
 | `postgres` | `postgres:16.16-alpine3.24` | Upgrades three Alpine packages and replaces gosu with Alpine's su-exec; PostgreSQL files unchanged. |
 | `nginx-ingress` | `public.ecr.aws/nginx/nginx-ingress:5.8.1-alpine` | Upgrades Alpine libexpat and libxml2; controller, nginx and modules unchanged. |
 
